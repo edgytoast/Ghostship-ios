@@ -1,0 +1,64 @@
+Overlay patch 0015: live iOS menu scale + Max Frame Rate cap (reference
+0015 rev2 ported). gSohIos.MenuScale multiplies INTO GameEngine::ScaleImGui
+(comparing the combined float keeps upstream's ratio mechanism and makes
+both the preset combobox and the iOS slider apply LIVE); finger-sized
+slider grabs; gSohIos.MaxFps (0=60,1=120 default) caps the MatchRefreshRate
+path (battery saver, Sync Wave 1 Display knob). __IOS__-only.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -1104,14 +1104,34 @@
+ 
+ void GameEngine::ScaleImGui() {
+     int32_t imGuiScaleIndex = CVarGetInteger("gSettings.ImGuiScale", defaultImGuiScale);
++#ifdef __IOS__
++    // GS_IOS (overlay 0015): gSohIos.MenuScale multiplies the preset for
++    // fine phone-fit control. Comparing the combined float (not the index)
++    // keeps upstream's ratio mechanism and makes BOTH knobs apply live.
++    // NO point->pixel compensation here (rev5 tried that): overlay 0051
++    // aligns this fork to POINT space like every other HM port, so a plain
++    // 0.85 is naturally the right size — identical to the Ship of Harkinian port 0015.
++    float scale = imguiScaleOptionToValue[imGuiScaleIndex] * CVarGetFloat("gSohIos.MenuScale", 0.85f);
++    if (scale == previousImGuiScale) {
++        return;
++    }
++#else
+     if (imGuiScaleIndex == previousImGuiScaleIndex) {
+         return;
+     }
+ 
+     float scale = imguiScaleOptionToValue[imGuiScaleIndex];
++#endif
+     float newScale = scale / previousImGuiScale;
+     ImGui::GetStyle().ScaleAllSizes(newScale);
+     ImGui::GetIO().FontGlobalScale = scale;
++#ifdef __IOS__
++    // Finger-sized slider grabs regardless of scale (reference device
++    // feedback: sliders were hard to drag).
++    if (ImGui::GetStyle().GrabMinSize < 22.0f) {
++        ImGui::GetStyle().GrabMinSize = 22.0f;
++    }
++#endif
+     previousImGuiScale = scale;
+     previousImGuiScaleIndex = imGuiScaleIndex;
+ }
+@@ -1205,7 +1225,19 @@
+ 
+ uint32_t GameEngine::GetInterpolationFPS() {
+     if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
++#ifdef __IOS__
++        // GS_IOS (overlay 0015 rev3): battery-saver cap. gSohIos.MaxFps is
++        // a LITERAL fps value {60,90,120} — the Ship of Harkinian port shell migrated the
++        // old 0/1 index semantics program-wide (its SeedDefaultsOnce
++        // rewrites legacy values; index-map .at(120) was the VP menu-crash
++        // of 2026-07-23). Clamp defensively.
++        int gsIosCapRaw = CVarGetInteger("gSohIos.MaxFps", 120);
++        uint32_t gsIosCap = gsIosCapRaw >= 120 ? 120u : (gsIosCapRaw >= 90 ? 90u : 60u);
++        uint32_t gsIosRate = Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate();
++        return gsIosRate < gsIosCap ? gsIosRate : gsIosCap;
++#else
+         return Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate();
++#endif
+     } else if (CVarGetInteger(CVAR_VSYNC_ENABLED, 1) ||
+                !Ship::Context::GetInstance()->GetWindow()->CanDisableVerticalSync()) {
+         return std::min<uint32_t>(Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate(),

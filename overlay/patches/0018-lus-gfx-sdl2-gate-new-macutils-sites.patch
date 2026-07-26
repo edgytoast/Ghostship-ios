@@ -1,0 +1,41 @@
+Overlay patch 0018 rev2 (rebased for LUS c151cc91): iOS analog of the
+desktop occlusion gate. rev1 also gated disableMacOSAppNap and
+isWindowOccluded off iOS — upstream absorbed BOTH verbatim at c151cc91
+(513923da "Fixed ios compilation errors": the exact
+`#if defined(__APPLE__) && !defined(__IOS__)` gates rev1 introduced), so
+only our feature remains: the shell's backgrounded flag wired into
+IsWindowVisible — Fast3dWindow's visibility gate then skips
+render+present while backgrounded exactly as the desktop occlusion path
+does (overlay 0016's park loop stays as belt-and-braces beneath it).
+Linkage spec at file scope; resolves at app link where the shell always
+exists (LUS standalone builds are archive-only, nothing to resolve).
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -751,6 +751,13 @@
+     return true;
+ }
+ 
++#ifdef __IOS__
++// GS_IOS (overlay 0018): shell-provided background flag — the iOS analog
++// of desktop window occlusion (linkage spec at file scope; block-scope
++// extern "C" does not compile in C++).
++extern "C" int SohIos_IsBackgrounded(void);
++#endif
++
+ bool GfxWindowBackendSDL2::IsWindowVisible() {
+     const uint32_t flags = SDL_GetWindowFlags(mWnd);
+     if (flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) {
+@@ -762,6 +769,12 @@
+     if (isWindowOccluded(mWnd)) {
+         return false;
+     }
++#elif defined(__IOS__)
++    // Backgrounded == occluded: Fast3dWindow's visibility gate then skips
++    // render+present (no nextDrawable while suspended; watchdog safety).
++    if (SohIos_IsBackgrounded()) {
++        return false;
++    }
+ #endif
+     return true;
+ }

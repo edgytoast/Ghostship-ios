@@ -1,0 +1,34 @@
+Overlay patch 0052: null-guard Fast3dGui::LoadGuiTexture(path). LUS
+dereferences the LoadResource() result without checking it — when the backing
+archive isn't mounted, .get() returns null and the Texture& overload faults
+reading res.Width at struct offset 0x20 (confirmed EXC_BAD_ACCESS / KERN_
+INVALID_ADDRESS at 0x20). This is deterministic on a fresh visionOS install or
+sim: the HUD glyph textures LoadGuiTextures() pulls (texture_hud_char_star/coin
+= __OTR__textures/segment2/...) live in the ROM-extracted sm64.o2r, which
+GameEngine::LoadResourceFiles adds only if it exists (Engine.cpp). No sm64.o2r
+(pre-onboarding) -> resource null -> crash in FinishInit before the user can
+even provide a ROM. The VP host boots the engine unconditionally from
+viewDidAppear (no onboarding gate like the iOS scene path), so the guard is
+what lets boot survive a missing archive. Pre-existing upstream bug; the
+point-space batch (0051) merely coincided with exposing it on the VP sim.
+Skipping a missing GUI texture is harmless — the glyph simply doesn't draw
+until its archive mounts.
+
+--- a/libultraship/src/fast/Fast3dGui.cpp
++++ b/libultraship/src/fast/Fast3dGui.cpp
+@@ -801,6 +801,15 @@
+     const auto res =
+         static_cast<Fast::Texture*>(Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true).get());
+ 
++    // GS_IOS (overlay 0052): LoadResource returns null when the backing archive
++    // isn't mounted (e.g. sm64.o2r absent on a fresh visionOS install/sim). The
++    // unguarded *res below then faults reading res.Width at struct offset 0x20.
++    // No-op the load so boot survives a missing archive instead of dying.
++    if (res == nullptr) {
++        SPDLOG_WARN("LoadGuiTexture: resource '{}' not found (archive not mounted?) - skipping", path);
++        return;
++    }
++
+     LoadGuiTexture(name, *res, tint);
+ }
+ 

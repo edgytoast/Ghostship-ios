@@ -1,0 +1,184 @@
+Overlay patch 0035: async Metal shader compilation (reference 0035 / 2ship D-008, device-validated). Cold newLibrary+newRenderPipelineState blocks the render thread ~120-160ms per shader on A-series -> area-transition freezes. Register the program shell + draw-read fields synchronously (draws bind it immediately, LoadShader before dispatch), run the compile on a detached thread (gSohIos.AsyncShaders, default ON, live kill switch via bridge cvar), publish each pipeline with a release fence, and SKIP draws whose pipeline is not ready yet (they pop in a few frames later). Fork adaptations vs reference: GetInstance (no GetRawInstance), no sRGB (unconditional BGRA8Unorm), extra prg fields (SHADER_PALETTE_TEXTURE, usedLighting), library/function null-guards preserved inside the lambda as release-and-return. Compile ledgers (lib_ms/pso_ms) via extern C readers. __IOS__-only; the #else keeps the pristine synchronous path.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -212,6 +212,27 @@
+     }
+ }
+ 
++#ifdef __IOS__
++#include <atomic>
++#include <chrono>
++#include <thread>
++// GS_IOS (overlay 0035): per-window shader-compile ledgers, reset on read by
++// the 0008 perf probe (lib_ms/lib_n/pso_ms/pso_n). newLibrary dominates a cold
++// compile, newRenderPipelineState the rest -- time BOTH or the stall is unexplained.
++static std::atomic<uint64_t> sSohIosLibWinUs{ 0 };
++static std::atomic<uint32_t> sSohIosLibWinCount{ 0 };
++extern "C" void SohIos_LibWindowStats(float* ms, unsigned int* count) {
++    *ms = (float)(sSohIosLibWinUs.exchange(0) / 1000.0);
++    *count = sSohIosLibWinCount.exchange(0);
++}
++static std::atomic<uint64_t> sSohIosPsoWinUs{ 0 };
++static std::atomic<uint32_t> sSohIosPsoWinCount{ 0 };
++extern "C" void SohIos_PsoWindowStats(float* ms, unsigned int* count) {
++    *ms = (float)(sSohIosPsoWinUs.exchange(0) / 1000.0);
++    *count = sSohIosPsoWinCount.exchange(0);
++}
++#endif
++
+ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+     CCFeatures cc_features;
+     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
+@@ -223,6 +244,120 @@
+     MTL::VertexDescriptor* vertex_descriptor =
+         gfx_metal_build_shader(buf, numFloats, cc_features, mCurrentFilterMode == FILTER_THREE_POINT);
+ 
++#ifdef __IOS__
++    // GS_IOS (overlay 0035): register the program shell + the fields the draw
++    // path reads SYNCHRONOUSLY so draws bind it immediately; the expensive
++    // compile fills the pipeline variants on a background thread when
++    // gSohIos.AsyncShaders is on (default), else inline. The pool element's
++    // address is stable across rehash (unordered_map), so prg crosses safely.
++    struct ShaderProgramMetal* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
++    prg->shader_id0 = shader_id0;
++    prg->shader_id1 = shader_id1;
++    prg->usedTextures[0] = cc_features.usedTextures[0];
++    prg->usedTextures[1] = cc_features.usedTextures[1];
++    prg->usedTextures[2] = cc_features.used_masks[0];
++    prg->usedTextures[3] = cc_features.used_masks[1];
++    prg->usedTextures[4] = cc_features.used_blend[0];
++    prg->usedTextures[5] = cc_features.used_blend[1];
++    prg->usedTextures[SHADER_PALETTE_TEXTURE] = cc_features.used_palette[0] || cc_features.used_palette[1];
++    prg->numInputs = cc_features.numInputs;
++    prg->numFloats = numFloats;
++    prg->usedLighting = cc_features.opt_lighting || cc_features.opt_texgen;
++    for (size_t sohIosV = 0; sohIosV < sizeof(prg->pipeline_state_variants) / sizeof(prg->pipeline_state_variants[0]);
++         sohIosV++) {
++        prg->pipeline_state_variants[sohIosV] = nullptr;
++    }
++    LoadShader((struct ShaderProgram*)prg);
++    const bool sohIosAsync =
++        Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gSohIos.AsyncShaders", 1) != 0;
++    // gfx_metal_build_shader autoreleases vertex_descriptor; retain it across
++    // the (possibly deferred) compile -- the lambda releases it on every path.
++    vertex_descriptor->retain();
++    auto sohIosCompile = [this, prg, buf, cc_features, vertex_descriptor]() {
++        NS::AutoreleasePool* sohIosPool = NS::AutoreleasePool::alloc()->init();
++        NS::Error* error = nullptr;
++        auto sohIosLibT0 = std::chrono::steady_clock::now();
++        MTL::Library* library =
++            mDevice->newLibrary(NS::String::string(buf.data(), NS::UTF8StringEncoding), nullptr, &error);
++        sSohIosLibWinUs.fetch_add((uint64_t)std::chrono::duration<double, std::micro>(
++                                      std::chrono::steady_clock::now() - sohIosLibT0)
++                                      .count());
++        sSohIosLibWinCount.fetch_add(1);
++        if (library == nullptr || error != nullptr) {
++            SPDLOG_ERROR("Failed to compile shader library, error {}",
++                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "(null library)");
++            vertex_descriptor->release();
++            sohIosPool->release();
++            return;
++        }
++        MTL::RenderPipelineDescriptor* pipeline_descriptor = MTL::RenderPipelineDescriptor::alloc()->init();
++        MTL::Function* vertexFunc = library->newFunction(NS::String::string("vertexShader", NS::UTF8StringEncoding));
++        MTL::Function* fragmentFunc =
++            library->newFunction(NS::String::string("fragmentShader", NS::UTF8StringEncoding));
++        if (vertexFunc == nullptr || fragmentFunc == nullptr) {
++            SPDLOG_ERROR("Failed to find shader functions (vertexShader={}, fragmentShader={})",
++                         vertexFunc != nullptr, fragmentFunc != nullptr);
++            pipeline_descriptor->release();
++            library->release();
++            vertex_descriptor->release();
++            sohIosPool->release();
++            return;
++        }
++        pipeline_descriptor->setVertexFunction(vertexFunc);
++        pipeline_descriptor->setFragmentFunction(fragmentFunc);
++        pipeline_descriptor->setVertexDescriptor(vertex_descriptor);
++        pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
++        pipeline_descriptor->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
++        if (cc_features.opt_alpha) {
++            pipeline_descriptor->colorAttachments()->object(0)->setBlendingEnabled(true);
++            pipeline_descriptor->colorAttachments()->object(0)->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
++            pipeline_descriptor->colorAttachments()->object(0)->setDestinationRGBBlendFactor(
++                MTL::BlendFactorOneMinusSourceAlpha);
++            pipeline_descriptor->colorAttachments()->object(0)->setRgbBlendOperation(MTL::BlendOperationAdd);
++            pipeline_descriptor->colorAttachments()->object(0)->setSourceAlphaBlendFactor(MTL::BlendFactorZero);
++            pipeline_descriptor->colorAttachments()->object(0)->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
++            pipeline_descriptor->colorAttachments()->object(0)->setAlphaBlendOperation(MTL::BlendOperationAdd);
++            pipeline_descriptor->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
++        } else {
++            pipeline_descriptor->colorAttachments()->object(0)->setBlendingEnabled(false);
++            pipeline_descriptor->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
++        }
++        for (int i = 0; i < ARRAY_COUNT(mMsaaNumQualityLevels); i++) {
++            if (mMsaaNumQualityLevels[i] == 1) {
++                int msaa_level = i + 1;
++                pipeline_descriptor->setSampleCount(msaa_level);
++                auto sohIosPsoT0 = std::chrono::steady_clock::now();
++                MTL::RenderPipelineState* pipeline_state =
++                    mDevice->newRenderPipelineState(pipeline_descriptor, &error);
++                sSohIosPsoWinUs.fetch_add((uint64_t)std::chrono::duration<double, std::micro>(
++                                              std::chrono::steady_clock::now() - sohIosPsoT0)
++                                              .count());
++                sSohIosPsoWinCount.fetch_add(1);
++                if (!pipeline_state || error != nullptr) {
++                    SPDLOG_ERROR("Failed to create pipeline state, error {}",
++                                 error->localizedDescription()->cString(NS::UTF8StringEncoding));
++                }
++                // Publish last: the draw guard reads a non-null pipeline as
++                // ready. Release fence orders the writes before the store.
++                std::atomic_thread_fence(std::memory_order_release);
++                prg->pipeline_state_variants[msaa_level] = pipeline_state;
++            }
++        }
++        vertexFunc->release();
++        fragmentFunc->release();
++        library->release();
++        pipeline_descriptor->release();
++        vertex_descriptor->release();
++        sohIosPool->release();
++    };
++    if (sohIosAsync) {
++        std::thread(sohIosCompile).detach();
++    } else {
++        sohIosCompile();
++    }
++    autorelease_pool->release();
++    return (struct ShaderProgram*)prg;
++#else
+     NS::Error* error = nullptr;
+     MTL::Library* library =
+         mDevice->newLibrary(NS::String::string(buf.data(), NS::UTF8StringEncoding), nullptr, &error);
+@@ -311,6 +446,7 @@
+     autorelease_pool->release();
+ 
+     return (struct ShaderProgram*)prg;
++#endif
+ }
+ 
+ struct ShaderProgram* GfxRenderingAPIMetal::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
+@@ -670,10 +806,20 @@
+     current_framebuffer.mCommandEncoder->setCullMode(cull);
+ 
+     if (current_framebuffer.mLastShaderProgram != mShaderProgram) {
+-        current_framebuffer.mLastShaderProgram = mShaderProgram;
+-
+         MTL::RenderPipelineState* pipeline_state =
+             mShaderProgram->pipeline_state_variants[current_framebuffer.mMsaaLevel];
++#ifdef __IOS__
++        // GS_IOS (overlay 0035): async compile not finished -- skip this draw;
++        // geometry pops in a few frames later when the pipeline lands. Do NOT
++        // advance mLastShaderProgram (retry next draw) or the vbo offset. Never
++        // fires in the synchronous path (variants non-null). Per-draw setup is
++        // idempotent, so the early return corrupts no state.
++        if (pipeline_state == nullptr) {
++            autorelease_pool->release();
++            return;
++        }
++#endif
++        current_framebuffer.mLastShaderProgram = mShaderProgram;
+         current_framebuffer.mCommandEncoder->setRenderPipelineState(pipeline_state);
+     }
+ 

@@ -1,0 +1,56 @@
+Overlay patch 0041 (new at pin 49c5312a): default upstream's ImGui touch
+overlay OFF on UIKit-shell builds. Upstream d6df12c0 added its own touch
+controls (src/port/ui/TouchControls.cpp, ImGui-drawn, injected into
+gControllerPads via TouchControls_ApplyPad in game_init.c) with
+TOUCH_CONTROLS_DEFAULT=1 on iOS/Android. This build ships the proven UIKit
+shell layer instead (floating dual sticks, per-button customizer,
+slide-across, haptics — SohIosShell.m); running both would double-draw and
+double-inject. Everything gates on Enabled() == CVarGetInteger(
+CVAR_TOUCH("Enabled"), TOUCH_CONTROLS_DEFAULT), so flipping the DEFAULT to
+0 under GS_IOS_UIKIT_SHELL (defined by overlay 0004 rev2) disables draw AND
+input injection while keeping upstream's overlay reachable via the CVar as
+a diagnostic/fallback. Android and non-shell iOS builds are unaffected.
+Second edit: upstream's new Settings > Controls "Touch Controls" section is
+compiled out under the same define — its Edit Layout button force-SETS
+CVAR_TOUCH("Enabled")=1, which would stack their overlay on top of ours
+one tap deep; our 0017 iOS section owns touch settings on this build (the
+CVar diagnostic path stays available via the console bridge).
+
+--- a/src/port/ui/TouchControls.cpp
++++ b/src/port/ui/TouchControls.cpp
+@@ -13,7 +13,12 @@
+ #include <cstdio>
+ #include <vector>
+ 
+-#if defined(PLATFORM_IOS) || defined(__IOS__) || defined(__ANDROID__)
++#if defined(GS_IOS_UIKIT_SHELL)
++// GS_IOS (overlay 0041): this build ships the UIKit touch shell — the
++// ImGui overlay stays available behind CVAR_TOUCH("Enabled") but defaults
++// OFF so the two layers don't double-draw/double-inject.
++#define TOUCH_CONTROLS_DEFAULT 0
++#elif defined(PLATFORM_IOS) || defined(__IOS__) || defined(__ANDROID__)
+ #define TOUCH_CONTROLS_DEFAULT 1
+ #else
+ #define TOUCH_CONTROLS_DEFAULT 0
+--- a/src/port/ui/GhostshipMenuSettings.cpp
++++ b/src/port/ui/GhostshipMenuSettings.cpp
+@@ -379,6 +379,11 @@
+         .HideInSearch(true)
+         .Options(WindowButtonOptions().Tooltip("Enables the separate Bindings Window."));
+ 
++#ifndef GS_IOS_UIKIT_SHELL
++    // GS_IOS (overlay 0041): this build's touch settings live in the iOS
++    // sidebar section (overlay 0017); upstream's section controls the
++    // ImGui overlay we default OFF — and its Edit Layout button would
++    // force-enable it on top of the UIKit layer.
+     AddWidget(path, "Touch Controls", WIDGET_SEPARATOR_TEXT);
+     AddWidget(path, "Enable Touch Controls", WIDGET_CVAR_CHECKBOX)
+         .CVar(CVAR_TOUCH("Enabled"))
+@@ -405,6 +410,7 @@
+             CVarSetInteger(CVAR_TOUCH("EditMode"), 1);
+             Ship::Context::GetInstance()->GetWindow()->GetGui()->GetMenu()->Hide();
+         });
++#endif // GS_IOS_UIKIT_SHELL
+ 
+     // Input Viewer
+     path.sidebarName = "Input Viewer";

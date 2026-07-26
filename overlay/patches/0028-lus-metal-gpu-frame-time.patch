@@ -1,0 +1,45 @@
+Overlay patch 0028: true GPU frame time (reference 0028 ported; Sync
+Wave 2 item 3 — the instrument that FOUND the vista-scene GPU overload).
+The 0008 probe's eng_ms includes in-present blocking, so it cannot
+distinguish "GPU saturated" from "GPU idle, stalls are CPU/pacing".
+Sample each screen command buffer's GPUEndTime-GPUStartTime via
+addCompletedHandler into a shell-owned volatile (never blocks; the bridge
+`drawable` command and the 0008 rev5 perf line read the cached value).
+Traps pre-paid per the wave doc: the extern is FILE-scope extern "C"
+(block-scope externs namespace-mangle), and readers only poll the cache.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -32,6 +32,14 @@
+ #include <spdlog/spdlog.h>
+ #include <spdlog/fmt/fmt.h>
+ 
++#ifdef __IOS__
++// GS_IOS (overlay 0028): defined in the app shell; C linkage (the shell is
++// ObjC). File scope — block-scope linkage specs don't compile in C++.
++extern "C" {
++extern volatile float gSohIosGpuMs;
++}
++#endif
++
+ #include "fast/backends/gfx_metal_shader.h"
+ 
+ #include "libultraship/libultra/abi.h"
+@@ -755,6 +763,17 @@
+         screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+     }
+     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
++#ifdef __IOS__
++    // GS_IOS (overlay 0028): true GPU duration of the frame's screen pass —
++    // the perf probe's eng_ms includes present blocking and cannot separate
++    // GPU saturation from pacing waits.
++    screen_framebuffer.mCommandBuffer->addCompletedHandler(MTL::HandlerFunction([](MTL::CommandBuffer* cb) {
++        double gsIosMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
++        if (gsIosMs > 0 && gsIosMs < 1000.0) {
++            gSohIosGpuMs = (float)gsIosMs;
++        }
++    }));
++#endif
+     screen_framebuffer.mCommandBuffer->commit();
+ 
+     // Now that commit has been called, retain the command buffer for GPU sync

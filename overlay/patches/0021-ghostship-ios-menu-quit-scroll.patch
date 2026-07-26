@@ -1,0 +1,81 @@
+Overlay patch 0021: iOS menu quit + touch scrolling (reference 0018
+intent; my 0018 number was already taken by the macUtils gates).
+Quit: menu quit must CVarSave + exit(0) after Window->Close() — Close alone
+leaves a frozen screen on iOS (no desktop main loop to unwind; Sync Wave 1
+mandatory fix 3). Scrolling: the shell queues finger scroll deltas
+(overlay 0013 rev2 exports); the menu's three scrollable children consume
+them when the finger is horizontally inside the child window. Mouse-free,
+so no hover tooltips and no slider side-effects. __IOS__-only.
+
+--- a/src/port/ui/Menu.cpp
++++ b/src/port/ui/Menu.cpp
+@@ -14,6 +14,11 @@
+ std::vector<ImVec2> windowTypeSizes = { {} };
+ 
+ extern std::unordered_map<s16, const char*> warpPointSceneList;
++
++#ifdef __IOS__
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW);
++extern "C" void CVarSave();
++#endif
+ extern void Warp();
+ 
+ namespace GhostshipGui {
+@@ -763,6 +768,12 @@
+                     menu->ToggleVisibility();
+                 }
+                 Ship::Context::GetInstance()->GetWindow()->Close();
++#ifdef __IOS__
++                // GS_IOS (overlay 0021): no desktop main loop to unwind to;
++                // Close() alone left a frozen screen. Save and go.
++                CVarSave();
++                exit(0);
++#endif
+             },
+             nullptr);
+     }
+@@ -833,6 +844,14 @@
+     ImGui::SetNextWindowSizeConstraints({ sidebarWidth, 0 }, { sidebarWidth, columnHeight });
+     ImGui::BeginChild((menuEntries.at(headerIndex).label + " Section").c_str(), { sidebarWidth, columnHeight * 3 },
+                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize, ImGuiWindowFlags_NoTitleBar);
++#ifdef __IOS__
++    {
++        float gsIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++        if (gsIosDy != 0.0f) {
++            ImGui::SetScrollY(ImGui::GetScrollY() - gsIosDy);
++        }
++    }
++#endif
+     for (auto& sidebarLabel : menuEntries.at(headerIndex).sidebarOrder) {
+         std::string nextIndex = "";
+         UIWidgets::PushStyleButton(menuThemeIndex);
+@@ -877,6 +896,14 @@
+         ImGui::SetNextWindowSizeConstraints({ sectionWidth, 0 }, { sectionWidth, columnHeight });
+         ImGui::BeginChild(sectionMenuId.c_str(), { sectionWidth, windowHeight * 4 }, ImGuiChildFlags_AutoResizeY,
+                           ImGuiWindowFlags_NoTitleBar);
++#ifdef __IOS__
++        {
++            float gsIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++            if (gsIosDy != 0.0f) {
++                ImGui::SetScrollY(ImGui::GetScrollY() - gsIosDy);
++            }
++        }
++#endif
+     }
+     if (headerSearch && menuSearchText.length() > 0) {
+         ImGui::AlignTextToFramePadding();
+@@ -914,6 +941,14 @@
+                 ImGui::SetNextWindowSizeConstraints({ columnWidth, 0 }, { columnWidth, columnHeight });
+                 ImGui::BeginChild(sectionId.c_str(), { columnWidth, windowHeight * 4 }, ImGuiChildFlags_AutoResizeY,
+                                   ImGuiWindowFlags_NoTitleBar);
++#ifdef __IOS__
++                {
++                    float gsIosDy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++                    if (gsIosDy != 0.0f) {
++                        ImGui::SetScrollY(ImGui::GetScrollY() - gsIosDy);
++                    }
++                }
++#endif
+             }
+             // for (auto& entryName : sidebar->at(sectionIndex).sidebarOrder) {
+             for (auto& entry : sidebar->at(sectionIndex).columnWidgets.at(i)) {

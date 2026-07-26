@@ -1,0 +1,63 @@
+Overlay patch 0050 rev2: correct the header tab-row width estimate so a
+spurious horizontal scrollbar doesn't appear under the tabs (device report
+2026-07-23: "that horizontal scrolling bar ... its unnecessary").
+
+The header tab row is a child window with ImGuiWindowFlags_HorizontalScrollbar,
+AutoResizeX and a max-width constraint of `headerWidth`. When that estimate is
+SHORT, the child is capped narrower than its own content, so ImGui shows a
+scrollbar even though every tab is visible. The estimate is short by design:
+the draw loop SameLine()s between EVERY pair of tabs (N-1 gaps) but the
+estimate adds style.ItemSpacing.x only ONCE (for the active tab). Ghostship
+has five tabs (Settings/Enhancements/Rando/Achievements/Dev Tools), so the
+~4 uncounted gaps push the real row past the capped width and the bar
+appears. Count ItemSpacing per gap so the constraint matches what is drawn;
+the row then fits and no bar shows. (rev1 also force-reserved the bar's
+HEIGHT unconditionally — removed: with the estimate correct there is no bar
+to make room for, and always-reserving is what the user then called
+unnecessary.) Desktop is byte-identical; the fix is pure arithmetic.
+
+--- a/src/port/ui/Menu.cpp
++++ b/src/port/ui/Menu.cpp
+@@ -653,13 +653,22 @@
+     if (headerSearch) {
+         headerWidth += 200.0f + style.ItemSpacing.x + style.FramePadding.x;
+     }
++    bool gsFirstHeaderTab = true;
+     for (auto& label : menuOrder) {
+         ImVec2 size = ImGui::CalcTextSize(label.c_str());
+         headerSizes.push_back(size);
+         headerWidth += size.x + style.FramePadding.x * 2;
+         if (label == headerIndex) {
++            headerWidth += style.ItemSpacing.x;
++        }
++        // GS_IOS (overlay 0050): the draw loop SameLine()s between every pair
++        // of tabs (N-1 gaps); the estimate above counted only the active
++        // tab's. Count a gap per tab after the first so headerWidth matches
++        // the drawn row (used for the height-reserve test below).
++        if (!gsFirstHeaderTab) {
+             headerWidth += style.ItemSpacing.x;
+         }
++        gsFirstHeaderTab = false;
+     }
+ 
+     // Full screen menu with widths below 1280, heights below 800.
+@@ -695,7 +704,19 @@
+     bool autoFocus = CVarGetInteger(CVAR_SETTING("Menu.SearchAutofocus"), 0);
+     ImGui::BeginChild("Header Selection", headerSelSize,
+                       ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
++#ifdef __IOS__
++                      // GS_IOS (overlay 0050): NO horizontal scrollbar on the
++                      // tab row. This port has five tabs + the search box; the
++                      // row is a hair wider than the child frame, so upstream's
++                      // HorizontalScrollbar draws a bar under tabs that are all
++                      // fully visible anyway (device report: "unnecessary").
++                      // Dropping the flag lets AutoResizeX size the child to
++                      // the content — the tabs simply fit, no bar. Desktop keeps
++                      // the scrollbar (mouse users can have narrow windows).
++                      ImGuiWindowFlags_NoTitleBar);
++#else
+                       ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_HorizontalScrollbar);
++#endif
+     uint8_t curIndex = 0;
+     for (auto& label : menuOrder) {
+         if (curIndex != 0) {

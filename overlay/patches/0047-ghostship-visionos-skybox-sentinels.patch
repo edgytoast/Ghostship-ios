@@ -1,0 +1,53 @@
+Overlay patch 0047 (visionOS Phase 02): skybox stereo sentinels (reference
+0033 pattern, sm64coopdx-proven mechanism). SM64's sky is drawn through an
+ORTHO projection (create_skybox_ortho_matrix MUL'd over dl_skybox), so
+0045's perspective-detect would leave it at ZERO disparity — a sky ON the
+panel plane, stereoscopically in FRONT of the terrain behind it (occlusion
+says farthest, stereo says nearest: the "disorienting clouds" class bug).
+Bracket the skybox display list with G_NOOP sentinel tags (0x5A begin /
+0x5B end; LUS's own disp-stack tags are 7/8, anything else passes through
+the noop handler untouched — verified on this fork). Between them 0045
+shifts the ortho by the perspective background-disparity asymptote,
+landing the sky at infinity. dlCommandCount grows by 2; __IOS__-gated so
+the desktop build's skybox DL is byte-identical.
+
+--- a/src/game/skybox.c
++++ b/src/game/skybox.c
+@@ -275,6 +275,9 @@
+  */
+ Gfx *init_skybox_display_list(s8 player, s8 background, s8 colorIndex) {
+     s32 dlCommandCount = 5 + (5 * 3) * 7; // 5 for start/end, plus 15 tiles (5-wide grid)
++#ifdef __IOS__
++    dlCommandCount += 2; // GS_VISION (overlay 0047): stereo sentinels
++#endif
+     void *skybox = alloc_display_list(dlCommandCount * sizeof(Gfx));
+     Gfx *dlist = skybox;
+ 
+@@ -283,11 +286,27 @@
+     } else {
+         Mtx *ortho = create_skybox_ortho_matrix(player);
+ 
++#ifdef __IOS__
++        /* GS_VISION (overlay 0047): stereo skybox BEGIN sentinel (header). */
++        {
++            Gfx* sohTag = dlist++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5A << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
+         gSPDisplayList(dlist++, dl_skybox_begin);
+         gSPMatrix(dlist++, VIRTUAL_TO_PHYSICAL(ortho), G_MTX_PROJECTION | G_MTX_MUL | G_MTX_NOPUSH);
+         gSPDisplayList(dlist++, dl_skybox_tile_tex_settings);
+         draw_skybox_tile_grid(&dlist, background, player, colorIndex);
+         gSPDisplayList(dlist++, dl_skybox_end);
++#ifdef __IOS__
++        /* GS_VISION (overlay 0047): stereo skybox END sentinel. */
++        {
++            Gfx* sohTag = dlist++;
++            sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5B << 16));
++            sohTag->words.w1 = 0;
++        }
++#endif
+         gSPEndDisplayList(dlist);
+     }
+     return skybox;

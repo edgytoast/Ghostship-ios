@@ -1,0 +1,63 @@
+Overlay patch 0016 (rebased for LUS c151cc91): park the game thread
+before nextDrawable while backgrounded. This fork already absorbed the
+null-drawable safety net and the Fast3dWindow visibility gate (reference
+0016's other half) — and at c151cc91 grew its own __IOS__ drawable-size
+pinning at the top of SetupScreenFramebuffer (513923da, kept verbatim) —
+but nothing stops a mid-frame nextDrawable when the app backgrounds
+between the visibility check and acquisition — background GPU work risks
+watchdog kills and degraded drawable pools (reference device finding).
+Gate on the shell's SohIos_IsBackgrounded flag (set in
+sceneDidEnterBackground, cleared on foreground): the game thread parks
+here — safe, the process suspends moments later — and resumes exactly
+here. Whether the upstream visibility gate alone suffices on iOS is a
+device-day question (docs/lus-divergence.md); this is defense in depth.
+__IOS__-only; linkage spec at file scope (block-scope extern "C" does not
+compile in C++).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -822,6 +822,13 @@
+     return (int)index;
+ }
+ 
++#ifdef __IOS__
++// GS_IOS (overlay 0016): shell-provided background flag + run-loop park
++// tick (linkage specs must live at file scope, not inside the function).
++extern "C" int SohIos_IsBackgrounded(void);
++extern "C" void SohIos_ParkTick(void);
++#endif
++
+ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
+ #ifdef __IOS__
+     // Keep the layer's drawable size pinned to the pixel viewport.
+@@ -830,7 +837,30 @@
+     }
+ #endif
+     mCurrentDrawable = nullptr;
++#ifdef __IOS__
++    // Park while backgrounded — nextDrawable in the background stalls/
++    // times out (post-resume slowdown, watchdog risk). The process
++    // suspends moments later and resumes here. ParkTick services the main
++    // run loop (the game loop IS the main thread on iOS) so the lifecycle
++    // events that clear the flag can deliver — a sleeping park here
++    // deadlocked into black-screen-with-audio resume (reference rev2,
++    // Sync Wave 1 mandatory fix 2). Post-resume, retry a drained drawable
++    // pool briefly; upstream's null guard below stays the final fallback.
++    {
++        while (SohIos_IsBackgrounded()) {
++            SohIos_ParkTick();
++        }
++        const struct timespec gsIosRetryNap = { 0, 10 * 1000 * 1000 };
++        for (int i = 0; i < 100 && mCurrentDrawable == nullptr; i++) {
++            mCurrentDrawable = mLayer->nextDrawable();
++            if (mCurrentDrawable == nullptr) {
++                nanosleep(&gsIosRetryNap, nullptr); // pool drained (just resumed?)
++            }
++        }
++    }
++#else
+     mCurrentDrawable = mLayer->nextDrawable();
++#endif
+ 
+     bool msaa_enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gMSAAValue", 1) > 1;
+ 

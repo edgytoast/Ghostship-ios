@@ -1,0 +1,124 @@
+Overlay patch 0051: run ImGui in POINT space on iOS/visionOS, matching
+EVERY other HarbourMasters port (SoH, 2ship, Starship, Spaghetti). THE fix
+for "the menu is far too small, no other port had to mess with this."
+
+This fork's newer LUS is the lone outlier: it forces the whole UI into
+DRAWABLE-PIXEL space in two places, so ImGui lays the menu out in ~2736 px
+where the shared shell (built for point space) and the Ship of Harkinian port 0015 both
+assume ~912 pt — hence a menu ~3x too small that needed compensation hacks.
+Verified by reading all three sibling forks: their GfxWindowBackendSDL2::
+GetDimensions uses SDL_GetWindowSize (points) and their Fast3dGui does NOT
+override io.DisplaySize. This patch makes Ghostship do the same:
+
+1. GetDimensions -> SDL_GetWindowSize (points) on __APPLE__, so wnd->
+   GetWidth() — which sizes the "Main - Deck" and "Main Game" windows — is
+   in points, exactly like the Ship of Harkinian port (gfx_sdl2.cpp:540) and 2ship (:522).
+2. Remove the Fast3dGui pixel-space override so io.DisplaySize stays the
+   point-space value ImGui_ImplSDL2_NewFrame set.
+
+Why this is safe where the earlier half-fix (retired 0049) was not: 0049
+changed ONLY DisplaySize and left GetDimensions returning pixels, so the
+deck window (GetWidth=2736) was 3x oversized in a 912-pt space and the game
+drew 2x too big. Changing BOTH makes everything point-consistent — the game
+image is a point-space quad that overlay 0010 upscales to the drawable
+(FramebufferScale = drawable/DisplaySize), and overlay 0032's SSAA scales
+mCurDimensions from the point content region up to native px, which is what
+0032's own comment always described. Same design the three siblings run.
+
+Deletes the entire compensation apparatus (0015 rev5/6, 0050, shell D13/D14)
+in one stroke: at point space a plain 0.85 is the right size.
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -578,12 +578,13 @@
+ 
+ void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
+ #ifdef __APPLE__
+-    if (mRenderer != nullptr) {
+-        // Metal: drawable pixels, not window points.
+-        SDL_GetRendererOutputSize(mRenderer, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+-    } else {
+-        SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+-    }
++    // GS_IOS (overlay 0051): POINTS, not drawable pixels — matches the
++    // reference and 2ship (SDL_GetWindowSize) so the whole UI lays out in
++    // point space. The drawable-pixel value this fork returned here is what
++    // made the menu ~3x too small; overlay 0010 upscales the game image to
++    // the drawable and overlay 0032 upscales the game render, so nothing
++    // needs the pixel size from here.
++    SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+ #else
+     SDL_GL_GetDrawableSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+ #endif
+--- a/libultraship/src/fast/Fast3dGui.cpp
++++ b/libultraship/src/fast/Fast3dGui.cpp
+@@ -74,35 +74,15 @@
+         case WindowBackend::FAST3D_SDL_OPENGL:
+         case WindowBackend::FAST3D_SDL_METAL:
+         case WindowBackend::FAST3D_SDL_VULKAN: {
+-#ifdef __IOS__
+-            // SDL reports coordinates in points; ImGui runs in pixels here.
+-            if (window->GetWindowBackend() == WindowBackend::FAST3D_SDL_METAL && mImpl.Metal.Renderer != nullptr) {
+-                SDL_Event scaled = *static_cast<const SDL_Event*>(event.Sdl.Event);
+-                int ww = 0, wh = 0, pw = 0, ph = 0;
+-                SDL_GetWindowSize(static_cast<SDL_Window*>(mImpl.Metal.Window), &ww, &wh);
+-                SDL_GetRendererOutputSize(mImpl.Metal.Renderer, &pw, &ph);
+-                const float sx = ww > 0 ? (float)pw / (float)ww : 1.0f;
+-                const float sy = wh > 0 ? (float)ph / (float)wh : 1.0f;
+-                switch (scaled.type) {
+-                    case SDL_MOUSEMOTION:
+-                        scaled.motion.x = (Sint32)(scaled.motion.x * sx);
+-                        scaled.motion.y = (Sint32)(scaled.motion.y * sy);
+-                        break;
+-                    case SDL_MOUSEBUTTONDOWN:
+-                    case SDL_MOUSEBUTTONUP:
+-                        scaled.button.x = (Sint32)(scaled.button.x * sx);
+-                        scaled.button.y = (Sint32)(scaled.button.y * sy);
+-                        break;
+-                    default:
+-                        break;
+-                }
+-                ImGui_ImplSDL2_ProcessEvent(&scaled);
+-            } else {
+-                ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
+-            }
+-#else
++            // GS_IOS (overlay 0051): process events UNSCALED. This fork used
++            // to scale mouse points->pixels here ("ImGui runs in pixels"); with
++            // ImGui now in POINT space (see the DisplaySize note above) and the
++            // shell injecting menu touches in points, that scaling put every tap
++            // ~3x off the point-space menu — nothing could be tapped or dragged
++            // (device report 2026-07-23). Point-space needs no scaling, matching
++            // the Ship of Harkinian port/2ship, whose event handlers pass SDL events straight
++            // through.
+             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
+-#endif
+ #if defined(__ANDROID__) || defined(__IOS__)
+             Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
+ #endif
+@@ -301,19 +281,12 @@
+         case WindowBackend::FAST3D_SDL_METAL:
+         case WindowBackend::FAST3D_SDL_VULKAN:
+             ImGui_ImplSDL2_NewFrame();
+-#ifdef __IOS__
+-            // Run ImGui in drawable-pixel space (the rest of the engine works in
+-            // pixels); touch input is scaled to match in HandleWindowEvents.
+-            if (window->GetWindowBackend() == WindowBackend::FAST3D_SDL_METAL && mImpl.Metal.Renderer != nullptr) {
+-                int pw = 0, ph = 0;
+-                SDL_GetRendererOutputSize(mImpl.Metal.Renderer, &pw, &ph);
+-                if (pw > 0 && ph > 0) {
+-                    ImGuiIO& io = ImGui::GetIO();
+-                    io.DisplaySize = ImVec2((float)pw, (float)ph);
+-                    io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+-                }
+-            }
+-#endif
++            // GS_IOS (overlay 0051): the drawable-pixel DisplaySize override
++            // this fork had here is REMOVED — ImGui stays in the point space
++            // ImGui_ImplSDL2_NewFrame set (like the Ship of Harkinian port/2ship, whose
++            // Fast3dGui has no such override), so the menu is naturally sized.
++            // overlay 0010 recomputes FramebufferScale in RenderDrawData so
++            // the game image still fills the drawable.
+             break;
+ #ifdef ENABLE_DX11
+         case WindowBackend::FAST3D_DXGI_DX11:

@@ -1,0 +1,58 @@
+Overlay patch 0046 (visionOS Phase 02): stereo comfort exports — the SM64
+analog of the Ship of Harkinian port 0032, radically smaller. SM64 keeps the camera in
+the MODELVIEW stack (perspective-only G_MTX_PROJECTION), so 0045 derives
+the whole stereo fold from the projection matrix itself: no camera basis,
+no P00 export. The game only writes, once per rendered frame in
+geo_process_perspective (runs on every screen incl. menus — a
+level_update-side hook would go stale on the title screen):
+- gSoh3DCamDist: gLakituState.focusDistance (refreshed every update at
+  camera.c:3108) — drives 0045's adaptive convergence;
+- gSoh3DPaused: pause/course-complete menu up (sCurrPlayMode !=
+  PLAY_MODE_NORMAL || gMenuMode != MENU_MODE_NONE);
+- gSoh3DInPlay: the port's own "actively in play" precedent (the mirror-
+  mode gate in this same function): PLAY_MODE_NORMAL && Mario exists with
+  a nonzero action && not credits — 0045 flattens stereo on title/file
+  select through this (the goddard head folds lookat INTO projection);
+- gSoh3DAiming: first-person C-up camera (gCamera->mode ==
+  CAMERA_MODE_C_UP) — 0045's aiming comfort profile.
+Globals are defined by the shell (SohIosShell.m); __IOS__-gated, desktop
+oracle unchanged. camera.h include added for gLakituState/gCamera/mode.
+
+--- a/src/game/rendering_graph_node.c
++++ b/src/game/rendering_graph_node.c
+@@ -23,6 +23,16 @@
+ extern s32 gCurrCreditsEntry;
+ extern struct MarioState *gMarioState;
+ 
++#ifdef __IOS__
++// GS_VISION (overlay 0046): stereo comfort exports (shell-defined globals).
++#include "camera.h"
++extern s16 gMenuMode; // ingame_menu.c; MENU_MODE_NONE == -1
++extern volatile float gSoh3DCamDist;
++extern volatile int gSoh3DPaused;
++extern volatile int gSoh3DInPlay;
++extern volatile int gSoh3DAiming;
++#endif
++
+ #define PLAY_MODE_NORMAL 0
+ 
+ /**
+@@ -276,6 +286,18 @@
+         gSPPerspNormalize(gDisplayListHead++, perspNorm);
+ 
+         gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(mtx), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
++
++#ifdef __IOS__
++        // GS_VISION (overlay 0046): stereo comfort exports for 0045 — see
++        // the patch header. Runs every rendered frame on every screen.
++        gSoh3DCamDist = gLakituState.focusDistance;
++        gSoh3DPaused = (sCurrPlayMode != PLAY_MODE_NORMAL) || (gMenuMode != -1);
++        gSoh3DInPlay = (sCurrPlayMode == PLAY_MODE_NORMAL && gMarioState != NULL && gMarioState->action != 0 &&
++                        gCurrCreditsEntry == NULL)
++                           ? 1
++                           : 0;
++        gSoh3DAiming = (gCamera != NULL && gCamera->mode == CAMERA_MODE_C_UP) ? 1 : 0;
++#endif
+ 
+         // Apply mirror mode transform after perspective projection
+         // Mirror during: normal gameplay, ending cutscenes, but NOT during credits text rendering

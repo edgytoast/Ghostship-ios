@@ -1,0 +1,17 @@
+Overlay patch 0044 (visionOS Phase 01): no ENABLE_OPENGL on visionOS
+(reference 0023 pattern). GLES does not exist on visionOS — gfx_opengl.cpp
+cannot compile there; Metal is the only backend. iOS keeps GLES as a
+debugging comparator. Every ENABLE_OPENGL consumer in LUS self-guards, so
+the define simply evaporating is safe.
+
+--- a/libultraship/src/CMakeLists.txt
++++ b/libultraship/src/CMakeLists.txt
+@@ -251,7 +251,7 @@
+     endif()
+ else()
+     target_compile_definitions(libultraship PRIVATE
+-        ENABLE_OPENGL
++        $<$<NOT:$<BOOL:${GS_VISIONOS}>>:ENABLE_OPENGL>
+         $<$<CONFIG:Debug>:_DEBUG>
+         $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}

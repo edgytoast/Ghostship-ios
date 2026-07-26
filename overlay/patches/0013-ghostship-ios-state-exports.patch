@@ -1,0 +1,82 @@
+Overlay patch 0013: game-state exports for the iOS shell (reference 0013).
+SohIos_* symbol names are kept verbatim so the shared shell needs no
+per-port rename (SHELL-DIVERGENCES.md). Appended at EOF of Engine.cpp —
+shares no hunks with 0006/0008 (reference D6). __IOS__-only.
+SM64 specifics: pause = sCurrPlayMode == PLAY_MODE_PAUSED (2,
+src/game/level_update.c); BGM = get_current_background_music() (u16;
+fanfare word reported as 0xffff — SM64 has no separate fanfare player id
+readily exported; revisit if music diagnostics need it).
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -1837,4 +1837,68 @@
+             return;
+         }
+     }
+-}
+\ No newline at end of file
++}
++#ifdef __IOS__
++// GS_IOS (overlay 0013): game-state exports for the shell's touch overlay.
++// Polled from the UIKit main thread, which interleaves with (never runs
++// beside) the SDL-driven game loop.
++extern "C" int16_t sCurrPlayMode; // src/game/level_update.c; 2 = PLAY_MODE_PAUSED
++
++extern "C" int SohIos_IsMenuOpen(void) {
++    auto ctx = Ship::Context::GetInstance();
++    if (ctx == nullptr) {
++        return 0;
++    }
++    auto wnd = ctx->GetWindow();
++    if (wnd == nullptr) {
++        return 0;
++    }
++    auto gui = wnd->GetGui();
++    if (gui == nullptr) {
++        return 0;
++    }
++    return gui->GetMenuOrMenubarVisible() ? 1 : 0;
++}
++
++extern "C" int SohIos_IsGamePaused(void) {
++    return sCurrPlayMode == 2 ? 1 : 0;
++}
++
++extern "C" uint32_t SohIos_ActiveSeqIds(void) {
++    return ((uint32_t)get_current_background_music()) | 0xFFFF0000u;
++}
++
++extern "C" int SohIos_IsPopupOpen(void) {
++    return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ? 1 : 0;
++}
++
++// Title/intro/file-select context (rev2): the shell keeps its menu button
++// visible there so users can tune settings at the start. SM64 signals:
++// no Mario object yet (goddard head / file select) or an attract demo
++// playing (gCurrDemoInput non-null). Opaque extern pointers — only
++// null-checked, never dereferenced.
++extern "C" void* gMarioObject;
++extern "C" void* gCurrDemoInput;
++extern "C" int SohIos_IsTitleOrDemo(void) {
++    return (gMarioObject == NULL || gCurrDemoInput != NULL) ? 1 : 0;
++}
++
++// Touch scrolling for the port menu (overlay 0021 consumes): the shell
++// queues finger scroll deltas here; Menu.cpp's scrollable children take
++// them if the finger is horizontally inside the child. Main-thread only
++// (the game loop IS the main thread on iOS) — no locking.
++static float sGsIosMenuScrollDy = 0.0f;
++static float sGsIosMenuScrollX = -1.0f;
++extern "C" void SohIos_QueueMenuScroll(float x, float dy) {
++    sGsIosMenuScrollX = x;
++    sGsIosMenuScrollDy += dy;
++}
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW) {
++    if (sGsIosMenuScrollDy == 0.0f || sGsIosMenuScrollX < winX || sGsIosMenuScrollX >= winX + winW) {
++        return 0.0f;
++    }
++    float dy = sGsIosMenuScrollDy;
++    sGsIosMenuScrollDy = 0.0f;
++    return dy;
++}
++#endif

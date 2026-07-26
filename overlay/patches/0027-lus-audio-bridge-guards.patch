@@ -1,0 +1,115 @@
+Overlay patch 0027: audio-bridge null-chain guards (reference 0027 ported;
+Sync Wave 2 crash-fix class, same family as 0030). The audio thread calls
+these every synth update; the bridge null-checked the PLAYER but not the
+CHAIN — Ship::Context::GetInstance() is mContext.lock() (null during
+teardown/init windows) and GetAudio() is briefly null, so
+GetInstance()->GetAudio()->GetAudioPlayer() faulted (reference device SEGV
+on OTRAudio_Thread, twice). Ghostship reaches it directly: the iOS quit
+path (0021) calls exit(0) after Window->Close() WITHOUT joining the audio
+thread, which keeps spinning through Context teardown. Guard the chain in
+all six bridge functions. Capturing the shared_ptr also holds a strong ref
+for the call, closing the race within each function. Unconditional (a
+null-check is always correct; upstreamable).
+
+--- a/libultraship/src/libultraship/bridge/audiobridge.cpp
++++ b/libultraship/src/libultraship/bridge/audiobridge.cpp
+@@ -5,7 +5,15 @@
+ extern "C" {
+ 
+ int32_t AudioPlayerBuffered() {
+-    auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
++    // GS_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetInstance() (weak_ptr.lock()) or GetAudio() is briefly null and the
++    // chained call faulted (device SEGV, 0030's family). The captured
++    // shared_ptr also pins the Context for this call.
++    auto gsIosCtx = Ship::Context::GetInstance();
++    if (gsIosCtx == nullptr || gsIosCtx->GetAudio() == nullptr) {
++        return 0;
++    }
++    auto audio = gsIosCtx->GetAudio()->GetAudioPlayer();
+     if (audio == nullptr) {
+         return 0;
+     }
+@@ -18,7 +26,15 @@
+ }
+ 
+ int32_t AudioPlayerGetDesiredBuffered() {
+-    auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
++    // GS_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetInstance() (weak_ptr.lock()) or GetAudio() is briefly null and the
++    // chained call faulted (device SEGV, 0030's family). The captured
++    // shared_ptr also pins the Context for this call.
++    auto gsIosCtx = Ship::Context::GetInstance();
++    if (gsIosCtx == nullptr || gsIosCtx->GetAudio() == nullptr) {
++        return 0;
++    }
++    auto audio = gsIosCtx->GetAudio()->GetAudioPlayer();
+     if (audio == nullptr) {
+         return 0;
+     }
+@@ -31,7 +47,15 @@
+ }
+ 
+ AudioChannelsSetting GetAudioChannels() {
+-    auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
++    // GS_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetInstance() (weak_ptr.lock()) or GetAudio() is briefly null and the
++    // chained call faulted (device SEGV, 0030's family). The captured
++    // shared_ptr also pins the Context for this call.
++    auto gsIosCtx = Ship::Context::GetInstance();
++    if (gsIosCtx == nullptr || gsIosCtx->GetAudio() == nullptr) {
++        return audioStereo;
++    }
++    auto audio = gsIosCtx->GetAudio()->GetAudioPlayer();
+ 
+     if (audio == nullptr) {
+         return audioStereo;
+@@ -41,7 +65,15 @@
+ }
+ 
+ int32_t GetNumAudioChannels() {
+-    auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
++    // GS_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetInstance() (weak_ptr.lock()) or GetAudio() is briefly null and the
++    // chained call faulted (device SEGV, 0030's family). The captured
++    // shared_ptr also pins the Context for this call.
++    auto gsIosCtx = Ship::Context::GetInstance();
++    if (gsIosCtx == nullptr || gsIosCtx->GetAudio() == nullptr) {
++        return 2;
++    }
++    auto audio = gsIosCtx->GetAudio()->GetAudioPlayer();
+ 
+     if (audio == nullptr) {
+         return 2;
+@@ -51,7 +83,15 @@
+ }
+ 
+ void AudioPlayerPlayFrame(const uint8_t* buf, size_t len) {
+-    auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
++    // GS_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetInstance() (weak_ptr.lock()) or GetAudio() is briefly null and the
++    // chained call faulted (device SEGV, 0030's family). The captured
++    // shared_ptr also pins the Context for this call.
++    auto gsIosCtx = Ship::Context::GetInstance();
++    if (gsIosCtx == nullptr || gsIosCtx->GetAudio() == nullptr) {
++        return;
++    }
++    auto audio = gsIosCtx->GetAudio()->GetAudioPlayer();
+     if (audio == nullptr) {
+         return;
+     }
+@@ -64,7 +104,13 @@
+ }
+ 
+ void SetAudioChannels(AudioChannelsSetting channels) {
+-    auto audio = Ship::Context::GetInstance()->GetAudio();
++    // GS_IOS (overlay 0027): guard GetInstance() null (teardown race); the
++    // existing audio==nullptr check below still covers GetAudio() null.
++    auto gsIosCtx = Ship::Context::GetInstance();
++    if (gsIosCtx == nullptr) {
++        return;
++    }
++    auto audio = gsIosCtx->GetAudio();
+     if (audio == nullptr) {
+         return;
+     }

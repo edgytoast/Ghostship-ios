@@ -1,0 +1,77 @@
+Overlay patch 0032: iOS supersampling (SSAA). On iOS the game renders
+offscreen into mGameFb at ImGui's POINT-space content region (~912x420) and
+Fast3dGui::DrawGame's ImGui::Image upscales that to the native-pixel fb0
+(2736x1260) — i.e. the render is currently SUB-NATIVE and upscaled, which reads
+as soft/grainy (mapped by a full render-pipeline audit 2026-07-21).
+
+Fix: in Interpreter::StartFrame — AFTER CalculateGameViewport sets mCurDimensions
+and BEFORE the framebuffer-resize block — scale mCurDimensions to
+(native drawable pixels * SSAA factor). The Apple render path already forces
+ViewportMatchesRendererResolution()==false, so the game always renders to
+mGameFb and the existing ImGui::Image blit downscales it to the native fb0 —
+turning the upscale into a proper supersample. Uniform factor keeps aspect
+(no crop/letterbox). Only mCurDimensions scales: mNativeDimensions (N64 virtual
+320x240) and mGameWindowViewport (points) are left alone — their
+'mCurDimensions == mGameWindowViewport' equality-guarded uses (CopyFrameBuffer
+src rect, pixel-depth, scissor) then deactivate to the safe full-fb path.
+Everything else (RATIO_X/Y, viewport, scissor, MSAA-resolve, fb0, ImGui overlay,
+point-space touches) rides mCurDimensions or is untouched. Clamped to the
+backend max texture size. The factor is native-px-relative so it lands on
+native*ssaa whether mCurDimensions is points or pixels. Shell provides
+SohIos_SsaaFactor (gSohIos.Supersample, 1.0-2.0) + SohIos_DrawablePixelWidth.
+__IOS__-only; the macOS build keeps upstream behavior.
+
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -6517,13 +6517,51 @@
+ #endif
+ }
+ 
++#ifdef __IOS__
++// GS_IOS (overlay 0032): SSAA hooks provided by the app shell (SohIosShell.m).
++extern "C" float SohIos_SsaaFactor(void);
++extern "C" uint32_t SohIos_DrawablePixelWidth(void);
++#endif
++
+ void Interpreter::StartFrame() {
+     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
+                          &mCurWindowPosY);
+     if (mCurDimensions.height == 0) {
+         // Avoid division by zero
+         mCurDimensions.height = 1;
++    }
++#ifdef __IOS__
++    // GS_IOS (overlay 0032) SSAA: CalculateGameViewport just set mCurDimensions
++    // from ImGui's POINT-space content region; the game renders offscreen to
++    // mGameFb, then Fast3dGui::DrawGame's ImGui::Image downscales it to the
++    // native-pixel fb0. Scale mCurDimensions to (native drawable px * ssaa) so
++    // the offscreen render is supersampled. Uniform factor => aspect preserved,
++    // no crop/letterbox. mNativeDimensions (N64 virtual res) and
++    // mGameWindowViewport (points) are NOT scaled — their equality-guarded uses
++    // deactivate to the safe full-fb path.
++    // rev2 (visionOS): never rescale during an eye pass — the 3D override
++    // later in StartFrame owns the dims there, and rescaling against the
++    // PARKED window's tiny drawable would double-realloc the eye fb every
++    // frame (sSoh3DEye is 0045's stereo state, declared above MatrixMul).
++    {
++        float gsSsaa = SohIos_SsaaFactor();
++        uint32_t gsNativePxW = SohIos_DrawablePixelWidth();
++        if (sSoh3DEye == 0 && gsSsaa > 0.0f && gsNativePxW > 0 && mCurDimensions.width > 0) {
++            float gsF = ((float)gsNativePxW / (float)mCurDimensions.width) * gsSsaa;
++            uint32_t gsW = (uint32_t)(mCurDimensions.width * gsF + 0.5f);
++            uint32_t gsH = (uint32_t)(mCurDimensions.height * gsF + 0.5f);
++            // mGameFb is a texture — clamp uniformly to the backend max.
++            int gsMax = mRapi->GetMaxTextureSize();
++            if (gsMax > 0 && ((int)gsW > gsMax || (int)gsH > gsMax)) {
++                float gsClamp = (float)gsMax / (float)(gsW > gsH ? gsW : gsH);
++                gsW = (uint32_t)(gsW * gsClamp);
++                gsH = (uint32_t)(gsH * gsClamp);
++            }
++            mCurDimensions.width = gsW;
++            mCurDimensions.height = gsH;
++        }
+     }
++#endif
+     mCurDimensions.aspect_ratio = (float)mCurDimensions.width / (float)mCurDimensions.height;
+ 
+     // Update the framebuffer sizes when the viewport or native dimension changes

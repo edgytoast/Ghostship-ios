@@ -1,0 +1,242 @@
+Overlay patch 0004 rev2 (rebased for upstream 49c5312a): Ghostship iOS
+app target glue. Upstream now ships its OWN iOS target (86d8edeb..49c5312a:
+PLATFORM overridable, global __IOS__ define, IOS_SIGNING option,
+storyboard/icon/plist bundle, o2r copy-if-exists) — this patch keeps only
+our deltas: skip upstream's mid-configure game-level toolchain include
+(toolchain/sysroot come from the caller + LUS's ios-toolchain-populate,
+overlay 0009); drop the placeholder YOUR_TEAM_ID attribute (signing comes
+from GS_IOS_* cache vars in the app-target block); define
+GS_IOS_UIKIT_SHELL=1 (overlay 0041 keys off it to default upstream's ImGui
+touch overlay OFF — this build ships the UIKit shell); main=SDL_main on
+src/port/Game.cpp (SDL2main's UIKit shim owns the real main); app shell
+wired via -DGS_IOS_SHELL_DIR; bundle id/team as cache vars (sim default
+com.harbourmasters.ghostship, unsigned; device id is reserved elsewhere);
+resources bundled: host-built ghostship.o2r (-DGS_O2R_PATH),
+gamecontrollerdb.txt, and the Torch extraction manifests (config.yml +
+assets/ -- the in-app extractor resolves them via GetAppBundlePath,
+overlay 0005). Missing Info.plist keys added (fullscreen, status bar,
+CADisableMinimumFrameDurationOnPhone, indirect input, ghostship:// URL
+scheme). rev1's ENABLE_OPENGL and ENABLE_SCRIPTING edits are RETIRED —
+upstream now gates both itself (ENABLE_OPENGL !iOS at CMakeLists:213,
+scripting forced OFF for iOS/Android at :463; ex-overlay-0006 is fully
+absorbed: Engine.cpp call sites are #ifdef ENABLE_SCRIPTING, ScriptLoader.h
+self-guards, SatellaClient.cpp self-gates on USE_NETWORKING which now
+defaults OFF on iOS).
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -97,18 +97,25 @@
+ endif()
+ 
+ if(IOS)
++    # GS_IOS (overlay 0004 rev2): toolchain/sysroot come from the caller +
++    # libultraship's ios-toolchain-populate (overlay 0009 keeps PLATFORM
++    # overridable: OS64 device, SIMULATORARM64 sim) — upstream's
++    # mid-configure game-level toolchain include is skipped, and the
++    # placeholder YOUR_TEAM_ID attribute is dropped (signing comes from the
++    # GS_IOS_* cache vars in the app-target block below). Upstream's global
++    # __IOS__ define (86d8edeb) is kept — it covers game TUs (reference D4).
++    # GS_IOS_UIKIT_SHELL marks this as a UIKit-shell build: overlay 0041
++    # defaults upstream's ImGui touch overlay OFF so the two touch layers
++    # don't double-draw/double-inject.
+     if(NOT DEFINED PLATFORM)
+         set(PLATFORM "OS64")
+     endif()
+     option(IOS_SIGNING "Code sign the iOS app (OFF produces an unsigned bundle for sideloading)" ON)
+-    include(cmake/ios.toolchain.cmake)
+     add_compile_definitions(
+         PLATFORM_IOS=1
+         __IOS__
++        GS_IOS_UIKIT_SHELL=1
+     )
+-    if(IOS_SIGNING)
+-        set(CMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "YOUR_TEAM_ID")
+-    endif()
+     set(BUNDLE_ID "dev.net64.ghostship")
+     set(SIGN_LIBRARY ON)
+     set(PROJECT_ID "${BUNDLE_ID}")
+@@ -592,10 +599,119 @@
+ endif()
+ 
+ if(${CMAKE_SYSTEM_NAME} STREQUAL "iOS")
+-    get_property(IOS_TOOLCHAIN_FILE GLOBAL PROPERTY IOS_TOOLCHAIN_FILE)
+-    include(${IOS_TOOLCHAIN_FILE})
+-    set(BUNDLE_ID "dev.hm64.soh")
+-    set(SIGN_LIBRARY ON)
++    set(GS_IOS_BUNDLE_IDENTIFIER "com.harbourmasters.ghostship" CACHE STRING "iOS bundle identifier")
++    set(GS_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
++    set_target_properties(${PROJECT_NAME} PROPERTIES
++        XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
++        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${GS_IOS_BUNDLE_IDENTIFIER}"
++        XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${GS_IOS_DEVELOPMENT_TEAM}"
++        XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
++        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
++        XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"
++        XCODE_ATTRIBUTE_SKIP_INSTALL "NO"
++    )
++    # LUS defines __IOS__ only PRIVATE to itself; game TUs (and the LUS
++    # headers they include) need it too or #ifdef __IOS__ silently
++    # evaporates in those TUs (reference D4).
++    target_compile_definitions(${PROJECT_NAME} PRIVATE __IOS__)
++    # SDL2main's UIKit shim provides the real main() -> UIApplicationMain ->
++    # SDL_main (Game.cpp includes SDL_main.h on iOS; see the Game.cpp hunk).
++    # visionOS (0004 rev3): Swift's @main is the entry instead — SDL2main
++    # must NOT be linked; SohHostViewController calls SDL_main directly
++    # once the window scene is live (vision playbook §1.2).
++    target_link_libraries(${PROJECT_NAME} PRIVATE "$<$<NOT:$<BOOL:${GS_VISIONOS}>>:SDL2main>")
++    # iOS app shell (touch overlay, console bridge, onboarding) lives in
++    # the port repo, passed as -DGS_IOS_SHELL_DIR.
++    if(NOT EXISTS "${GS_IOS_SHELL_DIR}/SohIosShell.m")
++        message(FATAL_ERROR "iOS build requires -DGS_IOS_SHELL_DIR=<dir with SohIosShell.m>")
++    endif()
++    target_sources(${PROJECT_NAME} PRIVATE "${GS_IOS_SHELL_DIR}/SohIosShell.m")
++    target_include_directories(${PROJECT_NAME} PRIVATE "${GS_IOS_SHELL_DIR}")
++    # GS_IOS (0004 rev4): app icon via ASSET CATALOG. Upstream ships a flat
++    # 200x200 ios/Icon.png through the legacy CFBundleIconFile — iOS tolerates
++    # that, but visionOS IGNORES it entirely and needs a LAYERED icon
++    # (AppIcon.solidimagestack: Front subject + Back plate, which the system
++    # parallaxes and crops to a circle). The catalog carries both: an
++    # AppIcon.appiconset for iOS/iPadOS and the solidimagestack for visionOS.
++    # Art is upstream's own logo.png (the ghost galleon + anchor).
++    if(NOT EXISTS "${GS_IOS_SHELL_DIR}/Assets.xcassets")
++        message(FATAL_ERROR "iOS build requires ${GS_IOS_SHELL_DIR}/Assets.xcassets (app icon catalog)")
++    endif()
++    target_sources(${PROJECT_NAME} PRIVATE "${GS_IOS_SHELL_DIR}/Assets.xcassets")
++    set_source_files_properties("${GS_IOS_SHELL_DIR}/Assets.xcassets" PROPERTIES
++        MACOSX_PACKAGE_LOCATION Resources)
++    set_target_properties(${PROJECT_NAME} PROPERTIES
++        XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon")
++    # GS_IOS (0004 rev5): the remote console bridge is a DEV tool — it injects
++    # input, writes CVars and reads crash.txt/logs — so upstream-of-us (the
++    # reference shell, 3698809) compiles it out behind SOH_REMOTE_CONSOLE and
++    # public builds cannot expose it at all. Ghostship defaults it ON because
++    # every build we ship goes to exactly one person over a private tailnet,
++    # and this bridge is our ONLY on-device debugging channel (moddir/cvar/
++    # hideprobe all ride it). It still needs a runtime opt-in at launch
++    # (SOH_CONSOLE env, the gSohIos.RemoteConsole setting, or a console_enabled
++    # file), so compiling it in does not open a port by itself.
++    option(SOH_REMOTE_CONSOLE "Compile in the remote console bridge (dev/private-OTA builds)" ON)
++    if(SOH_REMOTE_CONSOLE)
++        target_compile_definitions(${PROJECT_NAME} PRIVATE SOH_REMOTE_CONSOLE=1)
++        message(STATUS "ghostship: remote console COMPILED IN (private OTA build)")
++    else()
++        message(STATUS "ghostship: remote console compiled out (public-safe)")
++    endif()
++    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework UniformTypeIdentifiers"
++                                                  "-framework GameController")
++    # Resources: host-built port archive, controller db, and the Torch
++    # extraction manifests (config.yml + assets/). The in-app extractor
++    # resolves the manifests via GetAppBundlePath (overlay 0005).
++    set(GS_O2R_PATH "" CACHE FILEPATH "Path to a host-built ghostship.o2r to bundle")
++    if(NOT EXISTS "${GS_O2R_PATH}")
++        message(FATAL_ERROR "iOS build requires -DGS_O2R_PATH=<host-built ghostship.o2r>")
++    endif()
++    target_sources(${PROJECT_NAME} PRIVATE "${GS_O2R_PATH}" "${CMAKE_BINARY_DIR}/gamecontrollerdb.txt"
++                                           "${CMAKE_CURRENT_SOURCE_DIR}/config.yml")
++    set_source_files_properties("${GS_O2R_PATH}" "${CMAKE_BINARY_DIR}/gamecontrollerdb.txt"
++        "${CMAKE_CURRENT_SOURCE_DIR}/config.yml" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
++    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
++        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets"
++                "$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/assets"
++        COMMENT "Bundling Torch asset manifests (assets/)...")
++    if(GS_VISIONOS)
++        # GS_IOS (overlay 0004 rev3, vision playbook §1.2): SwiftUI app entry
++        # in its OWN flag-clean static lib — the Xcode generator ignores
++        # COMPILE_LANGUAGE genexes when composing OTHER_SWIFT_FLAGS, so any
++        # .swift source on the game target inherits its C warning flags and
++        # swiftc hard-errors. Swift's @main emits main; force_load extracts
++        # it from the archive (nothing else references the Swift objects).
++        enable_language(Swift)
++        add_library(ghostshipvisionswift STATIC "${GS_IOS_SHELL_DIR}/SohVisionApp.swift")
++        set_target_properties(ghostshipvisionswift PROPERTIES
++            XCODE_ATTRIBUTE_SWIFT_VERSION "5.0"
++            XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER "${GS_IOS_SHELL_DIR}/SohVision-Bridging-Header.h")
++        target_sources(${PROJECT_NAME} PRIVATE
++            "${GS_IOS_SHELL_DIR}/SohHostViewController.m"
++            "${GS_IOS_SHELL_DIR}/SohImmersive.m")
++        target_link_libraries(${PROJECT_NAME} PRIVATE
++            "-Wl,-force_load,$<TARGET_FILE:ghostshipvisionswift>"
++            "-L$(SDKROOT)/usr/lib/swift"
++            "-framework CompositorServices" "-framework ARKit" "-framework AVFAudio")
++        add_dependencies(${PROJECT_NAME} ghostshipvisionswift)
++        # ImmersiveSpace needs UIApplicationSupportsMultipleScenes INSIDE the
++        # UIApplicationSceneManifest dict (top-level is silently ignored).
++        # The key changes iPhone scene behavior, so it is spliced ONLY into a
++        # vision copy of the plist.
++        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/ios/plist.in" GS_VISION_PLIST)
++        string(REPLACE "</dict>
++</plist>" "	<key>UIApplicationSceneManifest</key>
++	<dict>
++		<key>UIApplicationSupportsMultipleScenes</key>
++		<true/>
++	</dict>
++</dict>
++</plist>" GS_VISION_PLIST "${GS_VISION_PLIST}")
++        file(WRITE "${CMAKE_BINARY_DIR}/plist-vision.in" "${GS_VISION_PLIST}")
++        set_target_properties(${PROJECT_NAME} PROPERTIES
++            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_BINARY_DIR}/plist-vision.in")
++    endif()
+ endif()
+ 
+ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+--- a/src/port/Game.cpp
++++ b/src/port/Game.cpp
+@@ -17,6 +17,14 @@
+ #include "sm64.h"
+ }
+ 
++#ifdef __IOS__
++// SDL2main's UIKit shim provides the real main() -> UIApplicationMain ->
++// SDL_main on the main thread. SDL_main.h renames our main() and declares
++// it with C linkage (a bare -Dmain=SDL_main would leave it C++-mangled and
++// SDL2main's expected _SDL_main symbol unresolved).
++#include <SDL2/SDL_main.h>
++#endif
++
+ void alloc_pool() {
+     static u64 pool[1024 * 1024 * 4];
+     main_pool_init(pool, pool + sizeof(pool) / sizeof(pool[0]));
+--- a/ios/plist.in
++++ b/ios/plist.in
+@@ -10,8 +10,8 @@
+ 	<string>$(EXECUTABLE_NAME)</string>
+ 	<key>CFBundleGetInfoString</key>
+ 	<string></string>
+-	<key>CFBundleIconFile</key>
+-  	<string>Icon</string>
++	<key>CFBundleIconName</key>
++	<string>AppIcon</string>
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
+ 	<key>CFBundlePackageType</key>
+@@ -50,5 +50,30 @@
+ 	</array>
+ 	<key>UISupportsDocumentBrowser</key>
+ 	<true/>
++	<key>UIStatusBarHidden</key>
++	<true/>
++	<key>UIRequiresFullScreen</key>
++	<true/>
++	<key>LSRequiresIPhoneOS</key>
++	<true/>
++	<key>CADisableMinimumFrameDurationOnPhone</key>
++	<true/>
++	<key>UIApplicationSupportsIndirectInputEvents</key>
++	<true/>
++	<key>ITSAppUsesNonExemptEncryption</key>
++	<false/>
++	<key>CFBundleShortVersionString</key>
++	<string>1.0.0</string>
++	<key>CFBundleURLTypes</key>
++	<array>
++		<dict>
++			<key>CFBundleURLName</key>
++			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
++			<key>CFBundleURLSchemes</key>
++			<array>
++				<string>ghostship</string>
++			</array>
++		</dict>
++	</array>
+ </dict>
+ </plist>

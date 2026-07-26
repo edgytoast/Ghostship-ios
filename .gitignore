@@ -1,0 +1,27 @@
+# Pristine upstream clone — reconstructed by scripts/bootstrap.sh (pin lives there + DECISIONS.md D0)
+vendor/
+
+# Local working copies of the user's ROMs — never committed
+work/gamedata/
+
+# Build trees
+oracle/build-cmake/
+oracle/shiphome/
+build*/
+
+# Heavy artifacts (screenshots/logs referenced from MEASUREMENTS.md stay small; traces don't)
+artifacts/*.trace
+artifacts/*.zip
+
+.DS_Store
+
+# Spike build trees (throwaway; recreated by build scripts)
+spikes/
+/tmp/
+
+# Dep sources/builds (recreated by scripts/build-mbedtls-ios.sh)
+work/mbedtls-src/
+work/ios-deps/
+work/ios-sim-deps/
+# Staged OTA payloads are build products (scripts recreate; served live)
+ota/*/*.ipa

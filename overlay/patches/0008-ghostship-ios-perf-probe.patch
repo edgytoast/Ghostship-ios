@@ -1,0 +1,148 @@
+Overlay patch 0008: iOS frame/tick cadence probe (reference 0008 ported).
+Per rendered sub-frame records the wall interval AND the time inside
+DrawAndRunGraphicsCommands (eng_ms); per 30 Hz game tick counts sim rate.
+Every 10 s logs GS_PERF wall_ms p50/p95/p99/max, eng_ms p50/p95, rendered
+fps, sim ticks/sec (expected 30.0 — no catch-up loop exists; see
+docs/frame-map.md), and thermal state via spdlog. Honest naming: BOTH
+metrics include in-present blocking; wall~=eng means blocked-inside
+(GPU/pacing), wall>>eng means CPU outside the render call. __IOS__-only.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -1347,7 +1347,111 @@
+ 
+ uint32_t GameEngine::GetGameVersion() {
+     return Ship::Context::GetInstance()->GetResourceManager()->GetArchiveManager()->GetGameVersions()[0];
++}
++
++#ifdef __IOS__
++// GS_PERF (overlay 0008): frame/tick cadence probe. wall_ms is the interval
++// between consecutive rendered sub-frames; eng_ms is the time inside
++// DrawAndRunGraphicsCommands. BOTH include in-present blocking, so
++// wall~=eng means blocked-inside (GPU/pacing), wall>>eng means CPU outside.
++// Thermal state provider lives in the app shell (SohIosShell.m).
++#include <chrono>
++extern "C" int SohIos_ThermalState(void);
++// GS_IOS (overlay 0028/0008 rev5): cached GPU frame time, written by the
++// Metal completion handler, defined in the shell.
++extern "C" volatile float gSohIosGpuMs;
++#include <atomic>
++#include <cstdint>
++// GS_IOS (overlay 0031): audio-ring watermark atomics, defined next to the
++// self-pump audio thread earlier in this TU (aud_min=0 => underrun — the
++// fuzzy-audio retest instrument). The 0008 probe reads them; 0031 defines +
++// feeds them; the two ship together in the series.
++extern std::atomic<int32_t> sGsIosAudMinBuffered;
++extern std::atomic<int32_t> sGsIosAudMaxBuffered;
++// GS_IOS (overlay 0035): async shader compile-time ledgers (lib = MSL->library,
++// pso = pipeline). 0035 defines the readers; a nonzero lib_ms with a FLAT
++// wall_ms proves the compile moved off the render thread (the stutter fix).
++extern "C" void SohIos_LibWindowStats(float* ms, unsigned int* count);
++extern "C" void SohIos_PsoWindowStats(float* ms, unsigned int* count);
++namespace GsIosPerf {
++struct Probe {
++    std::vector<double> frameMs;
++    std::vector<double> engMs;
++    std::vector<double> gpuMs;
++    uint64_t ticks = 0;
++    std::chrono::steady_clock::time_point lastFrame{};
++    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
++    float hudFps = 0.0f;
++    uint32_t hudFrames = 0;
++    std::chrono::steady_clock::time_point hudWindowStart = std::chrono::steady_clock::now();
++    void OnFrame(double engineMs) {
++        engMs.push_back(engineMs);
++        auto now = std::chrono::steady_clock::now();
++        if (lastFrame.time_since_epoch().count() != 0) {
++            double gsIntervalMs = std::chrono::duration<double, std::milli>(now - lastFrame).count();
++            // Skip background-resume / level-load gaps (>1 s): the probe pauses
++            // with rendering while backgrounded, so the resume frame's interval
++            // is the whole away-time — not an in-game stutter. Including it
++            // poisoned wall_ms max/percentiles (a 22 s "frame" from an app
++            // switch). eng_ms/gpu_ms/ticks are unaffected.
++            if (gsIntervalMs <= 1000.0) {
++                frameMs.push_back(gsIntervalMs);
++            }
++        }
++        lastFrame = now;
++        gpuMs.push_back((double)gSohIosGpuMs);
++        // Rolling 1 s fps for the shell's performance HUD (rev4).
++        hudFrames++;
++        double hudEl = std::chrono::duration<double>(now - hudWindowStart).count();
++        if (hudEl >= 1.0) {
++            hudFps = (float)(hudFrames / hudEl);
++            hudFrames = 0;
++            hudWindowStart = now;
++        }
++    }
++    void OnTick() {
++        ticks++;
++        auto now = std::chrono::steady_clock::now();
++        double el = std::chrono::duration<double>(now - lastReport).count();
++        if (el < 10.0 || frameMs.size() < 8 || engMs.size() < 8) {
++            return;
++        }
++        std::sort(frameMs.begin(), frameMs.end());
++        std::sort(engMs.begin(), engMs.end());
++        std::sort(gpuMs.begin(), gpuMs.end());
++        auto pct = [](std::vector<double>& v, double p) { return v[(size_t)(p * (v.size() - 1))]; };
++        // GS_IOS (overlay 0031): audio-ring watermarks this window. aud_min=0
++        // is an underrun (the fuzzy-audio symptom). Read+reset the atomics the
++        // self-pump loop feeds; INT32_MAX sentinel (no samples) prints as -1.
++        int32_t gsAudMin = sGsIosAudMinBuffered.exchange(INT32_MAX);
++        int32_t gsAudMax = sGsIosAudMaxBuffered.exchange(-1);
++        float gsLibMs = 0.0f, gsPsoMs = 0.0f;
++        unsigned int gsLibN = 0, gsPsoN = 0;
++        SohIos_LibWindowStats(&gsLibMs, &gsLibN);
++        SohIos_PsoWindowStats(&gsPsoMs, &gsPsoN);
++        SPDLOG_INFO("GS_PERF wall_ms p50={:.2f} p95={:.2f} p99={:.2f} max={:.2f} "
++                    "eng_ms p50={:.2f} p95={:.2f} gpu_ms p50={:.2f} p95={:.2f} n={} fps={:.1f} sim_tps={:.2f} "
++                    "aud_min={} aud_max={} lib_ms={:.1f} lib_n={} pso_ms={:.1f} pso_n={} thermal={}",
++                    pct(frameMs, 0.5), pct(frameMs, 0.95), pct(frameMs, 0.99), frameMs.back(),
++                    pct(engMs, 0.5), pct(engMs, 0.95), pct(gpuMs, 0.5), pct(gpuMs, 0.95), frameMs.size(),
++                    frameMs.size() / el, ticks / el,
++                    (gsAudMin == INT32_MAX ? -1 : gsAudMin), gsAudMax,
++                    gsLibMs, gsLibN, gsPsoMs, gsPsoN, SohIos_ThermalState());
++        frameMs.clear();
++        engMs.clear();
++        gpuMs.clear();
++        ticks = 0;
++        lastReport = now;
++    }
++};
++static Probe gPerfProbe;
++} // namespace GsIosPerf
++
++// Rolling 1-second fps for the shell's performance HUD (rev4).
++extern "C" void SohIos_HudStats(float* fps) {
++    *fps = GsIosPerf::gPerfProbe.hudFps;
+ }
++#endif
+ 
+ void GameEngine::RunCommands(Gfx* Commands, const std::vector<FrameInterpolationResult>& replacements) {
+     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetInstance()->GetWindow());
+@@ -1366,7 +1470,14 @@
+ #ifdef __SWITCH__ // Switch LUS Needs to be updated, so for now lets keep it simple
+         wnd->DrawAndRunGraphicsCommands(Commands, r.mtx);
+ #else
++#ifdef __IOS__
++        auto gsIosEngT0 = std::chrono::steady_clock::now();
++#endif
+         wnd->DrawAndRunGraphicsCommands(Commands, r.mtx, r.dl);
++#ifdef __IOS__
++        GsIosPerf::gPerfProbe.OnFrame(
++            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gsIosEngT0).count());
++#endif
+ #endif
+         interpreter->mInterpolationIndex++;
+     }
+@@ -1419,6 +1530,9 @@
+         wnd->SetMaximumFrameLatency(1);
+     }
+     RunCommands(commands, mtx_replacements);
++#ifdef __IOS__
++    GsIosPerf::gPerfProbe.OnTick();
++#endif
+ 
+     last_fps = fps;
+ }

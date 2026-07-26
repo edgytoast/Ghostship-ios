@@ -1,0 +1,24 @@
+Overlay patch 0029 rev2 (rebased for LUS c151cc91): anisotropy bump on
+upstream's auto-mipmap sampler. rev1 introduced the trilinear+aniso sampler
+for generated chains; upstream c151cc91 absorbed the concept (auto_mipmaps
+textures sample trilinear + aniso, native N64 chains keep nearest/explicit
+level()) but ships maxAnisotropy(8). D12 measured 16 on-device: SM64's
+ground is always viewed at a grazing angle — aniso=4 undersampled the
+footprint into vertical streaks (the D11 misdiagnosis), 16 (Metal max) is
+sharp AND smooth, sim 3-way + device artifacts (pack-fidelity-3way.png).
+8 vs 16 has not been A/B'd on-device; if a regression is ever suspected,
+this one-liner is the first thing to toggle.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -447,7 +447,9 @@
+     // derivative LOD with trilinear blending (no per-pixel stipple) + anisotropy.
+     if (texture_data->auto_mipmaps) {
+         sampler_descriptor->setMipFilter(MTL::SamplerMipFilterLinear);
+-        sampler_descriptor->setMaxAnisotropy(8);
++        // GS_IOS (overlay 0029 rev2): 16 (Metal max), not upstream's 8 —
++        // D12: SM64 grazing-angle ground undersamples below it (streaks).
++        sampler_descriptor->setMaxAnisotropy(16);
+     } else {
+         sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
+     }

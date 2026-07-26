@@ -1,0 +1,35 @@
+Overlay patch 0040: run the Satella boot phase only where its consumer
+exists (gate on ENABLE_SCRIPTING). Device feedback (2026-07-21): first
+launch shows "Connecting to Satella..." and BLOCKS for seconds while
+RunExtract's GS_COMPILE runs Satella::Client::Execute() before loading
+resources. Satella (satella.net64.dev) is a ONE-SHOT at boot:
+Connecting -> FetchingKeys -> Done. Those keys are for MOD SIGNATURE
+VERIFICATION, and the relay API they enable is used by SCRIPTED mods — both
+require ENABLE_SCRIPTING, which is compiled OUT on iOS (overlay 0004/0006).
+So on iOS the phase connects, fetches keys nothing reads (0006 rev2 makes
+the iOS keystore registration a no-op), and just walls the user behind the
+modal — pure delay, no function. This is NOT a platform disable: gate the
+phase on `defined(ENABLE_SCRIPTING)` so Satella runs on desktop (and on iOS
+too if scripting is ever enabled) and is skipped only where it has nothing
+to do. Respects upstream intent + auto-restores with scripting. Answers the
+Q-003 note ("flip it if device testing shows hangs") without removing the
+feature. Asset/o2r texture packs never used Satella (AddArchive has no
+signature gate), so pack loading is unaffected.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -904,7 +904,13 @@
+                 continue;
+             }
+             case GS_COMPILE: {
+-#ifdef USE_NETWORKING
++                // GS_IOS (overlay 0040): Satella fetches mod-signing keys +
++                // enables the scripted-mod relay — both need ENABLE_SCRIPTING.
++                // When scripting is compiled out (iOS) the phase has no
++                // consumer and only adds a blocking "Connecting..." delay, so
++                // gate it on scripting rather than platform (auto-restores if
++                // scripting is ever enabled on iOS).
++#if defined(USE_NETWORKING) && defined(ENABLE_SCRIPTING)
+                 if (CVarGetInteger(CVAR_DEVELOPER_TOOLS("Satella"), 1) == 1) {
+                     threadPool->submit_task([&]() -> void {
+                         Satella::Client::Instance().Execute();

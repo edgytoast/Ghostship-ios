@@ -1,0 +1,65 @@
+Overlay patch 0042 (visionOS Phase 01): CMAKE_SYSTEM_NAME dispatch flip.
+The leetal ios-cmake toolchain sets CMAKE_SYSTEM_NAME=visionOS for
+PLATFORM=VISIONOS, but this tree (game + LUS) dispatches on
+STREQUAL "iOS" everywhere. Flip visionOS -> iOS (+ IOS=1 + GS_VISIONOS=1)
+at every point where platform init re-runs — each project() call and the
+LUS toolchain include re-derive CMAKE_SYSTEM_NAME, so the flip appears
+THREE times (reference 0022 pattern, proven through 15 device rounds).
+Compilers/sysroot/SDKROOT are already locked by then; only dispatch is
+affected. Source-level discriminator stays TARGET_OS_VISION;
+GS_VISIONOS gates genuinely-vision-specific CMake deltas (Swift app lib,
+no SDL2main, no ENABLE_OPENGL — 0004 rev3 / 0044).
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,6 +2,15 @@
+ 
+ # Set the project version and language
+ project(Ghostship VERSION 2.1.0 LANGUAGES C CXX ASM)
++
++# GS_IOS (overlay 0042): visionOS builds dispatch through the iOS paths.
++# The leetal toolchain re-derives CMAKE_SYSTEM_NAME at every project()/
++# toolchain include, so this flip repeats at each such site.
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(GS_VISIONOS 1)
++endif()
+ include(FetchContent)
+ 
+ include(cmake/ghostship-cvars.cmake)
+--- a/libultraship/CMakeLists.txt
++++ b/libultraship/CMakeLists.txt
+@@ -19,6 +19,15 @@
+ 
+ project(libultraship LANGUAGES C CXX)
+ 
++# GS_IOS (overlay 0042): visionOS builds dispatch through the iOS paths.
++# The leetal toolchain re-derives CMAKE_SYSTEM_NAME at every project()/
++# toolchain include, so this flip repeats at each such site.
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(GS_VISIONOS 1)
++endif()
++
+ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     enable_language(OBJCXX)
+     set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
+@@ -75,7 +84,16 @@
+ # === Platform Specific Configuration ===
+ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     include(cmake/ios-toolchain-populate.cmake)
++
++# GS_IOS (overlay 0042): visionOS builds dispatch through the iOS paths.
++# The leetal toolchain re-derives CMAKE_SYSTEM_NAME at every project()/
++# toolchain include, so this flip repeats at each such site.
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(GS_VISIONOS 1)
+ endif()
++endif()
+ 
+ # =========== Sources =============
+ add_subdirectory("src")

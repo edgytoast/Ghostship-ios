@@ -1,0 +1,114 @@
+Overlay patch 0019 rev5 (rebased for LUS c151cc91): harden Metal texture
+uploads — clamp, null-guard, exact byte ledger. The rev3/rev4 GENERATED-MIP
+machinery (gsIosWantMips heuristic + deferred EndFrame GPU blit) is RETIRED:
+upstream c151cc91 grew its own auto-mipmap system (08bb8748..c345b7a5) that
+supersedes it and is better — CPU alpha-weighted box pyramids with
+alpha-test coverage preservation, keyed on mImportIsHd (the actual
+HD-replacement import path, not a dimension heuristic), palette-indexed
+textures excluded (averaging indices is meaningless — our GPU blit would
+have averaged them), uploaded per-level via UploadTextureMip, sampled
+trilinear+aniso via the auto_mipmaps flag (0029 rev2 bumps upstream's
+aniso 8 to the D12-measured 16). What remains here, on BOTH upload paths
+(UploadTextureMip now carries every HD/pack texture — it is the hot path):
+- clamp oversized uploads to GetMaxTextureSize (Metal ABORTS past the
+  limit; ImportTextureRaw's OOB-load fallback produces 65536x1 strips,
+  which still route through UploadTexture since height<=1 is excluded
+  from upstream's automipmaps);
+- null-guard newTexture under memory pressure (unchecked replaceRegion
+  dereferenced null; stale texels beat a crash);
+- exact GPU byte ledger via allocatedSize (feeds 0020's byte-budget
+  eviction; mip-aware by construction).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -354,6 +354,21 @@
+ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+     if (width == 0 || height == 0) {
+         return;
++    }
++
++    // GS_IOS (overlay 0019): Metal aborts the process (no error return) if a
++    // texture dimension exceeds the device limit. ImportTextureRaw's OOB-load
++    // fallback flattens over-requested HD-pack loads into a single line
++    // (e.g. 65536x1), which trips that limit. Clamp and log instead of dying;
++    // the flattened bytes past the clamp are zero-fill/garbage by
++    // construction. bytes_per_row keeps the SOURCE stride so a clamped
++    // region stays row-correct.
++    const uint32_t gsIosSrcWidth = width;
++    const uint32_t gsIosMaxDim = (uint32_t)GetMaxTextureSize();
++    if (width > gsIosMaxDim || height > gsIosMaxDim) {
++        SPDLOG_WARN("UploadTexture: clamping oversized texture {}x{} to device max {}", width, height, gsIosMaxDim);
++        width = width > gsIosMaxDim ? gsIosMaxDim : width;
++        height = height > gsIosMaxDim ? gsIosMaxDim : height;
+     }
+ 
+     TextureDataMetal* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
+@@ -372,14 +387,28 @@
+     MTL::Texture* texture = texture_data->texture;
+     if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
+         texture_data->texture->height() != height || texture_data->texture->mipmapLevelCount() != 1) {
+-        if (texture_data->texture != nullptr)
++        if (texture_data->texture != nullptr) {
++            // GS_IOS (overlay 0019): keep the GPU byte ledger exact.
++            mTextureBytes -= texture_data->texture->allocatedSize();
+             texture_data->texture->release();
++            texture_data->texture = nullptr;
++        }
+ 
+         texture = mDevice->newTexture(texture_descriptor);
++        // GS_IOS (overlay 0019): under memory pressure newTexture returns
++        // nil; the unchecked replaceRegion below then dereferenced null.
++        // Skip the upload (stale/garbage texel data beats a crash).
++        if (texture == nullptr) {
++            SPDLOG_ERROR("UploadTexture: newTexture failed ({}x{}, {} MB resident) — skipping upload", width, height,
++                         mTextureBytes / (1024 * 1024));
++            autorelease_pool->release();
++            return;
++        }
++        mTextureBytes += texture->allocatedSize();
+     }
+ 
+     NS::UInteger bytes_per_pixel = 4;
+-    NS::UInteger bytes_per_row = bytes_per_pixel * width;
++    NS::UInteger bytes_per_row = bytes_per_pixel * gsIosSrcWidth;
+     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
+     texture_data->texture = texture;
+     texture_data->mip_levels = 1;
+@@ -399,10 +428,22 @@
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+ 
+     if (level == 0) {
++        // GS_IOS (overlay 0019): same clamp/null-guard/ledger as
++        // UploadTexture — this is the fork's second allocation path.
++        const uint32_t gsIosMaxDim = (uint32_t)GetMaxTextureSize();
++        if (width > gsIosMaxDim || height > gsIosMaxDim) {
++            SPDLOG_WARN("UploadTextureMip: clamping oversized texture {}x{} to device max {}", width, height,
++                        gsIosMaxDim);
++            width = width > gsIosMaxDim ? gsIosMaxDim : width;
++            height = height > gsIosMaxDim ? gsIosMaxDim : height;
++        }
+         if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
+             texture_data->texture->height() != height || texture_data->texture->mipmapLevelCount() != totalLevels) {
+-            if (texture_data->texture != nullptr)
++            if (texture_data->texture != nullptr) {
++                mTextureBytes -= texture_data->texture->allocatedSize();
+                 texture_data->texture->release();
++                texture_data->texture = nullptr;
++            }
+ 
+             MTL::TextureDescriptor* texture_descriptor =
+                 MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
+@@ -411,6 +452,13 @@
+             texture_descriptor->setSampleCount(1);
+             texture_descriptor->setStorageMode(MTL::StorageModeShared);
+             texture_data->texture = mDevice->newTexture(texture_descriptor);
++            if (texture_data->texture == nullptr) {
++                SPDLOG_ERROR("UploadTextureMip: newTexture failed ({}x{}, {} MB resident) — skipping upload", width,
++                             height, mTextureBytes / (1024 * 1024));
++                autorelease_pool->release();
++                return;
++            }
++            mTextureBytes += texture_data->texture->allocatedSize();
+         }
+         texture_data->mip_levels = totalLevels;
+         texture_data->auto_mipmaps = mNextTextureAutoMipmap;

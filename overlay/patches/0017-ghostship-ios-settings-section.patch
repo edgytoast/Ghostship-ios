@@ -1,0 +1,190 @@
+Overlay patch 0017: "iOS" section in the port's Settings sidebar
+(Sync Wave 1 settings spec, adapted). Sections/knobs per the spec —
+Touch Controls (Haptics, Opacity, Left-Handed, Stick Response, Customize
+Layout), Display (Max Frame Rate per 0015, Performance HUD), Menu (LIVE
+Menu Scale via ScaleImGui), Advanced (Remote Console :8769).
+GHOSTSHIP-SPECIFIC: NO lock modes (SM64 = momentary everything, per-game
+policy) — the Ship of Harkinian port Double-Tap-Z row is deliberately absent, and the
+shell's Z handler is momentary-only. __IOS__-gated; oracle unchanged.
+
+--- a/src/port/ui/GhostshipMenuSettings.cpp
++++ b/src/port/ui/GhostshipMenuSettings.cpp
+@@ -6,6 +6,9 @@
+ #include "TouchControls.h"
+ #include "UIWidgets.hpp"
+ #include <spdlog/fmt/fmt.h>
++#ifdef __APPLE__
++#include <TargetConditionals.h> // GS_IOS (0017): TARGET_OS_VISION knobs
++#endif
+ 
+ extern "C" {
+ #include "variables.h"
+@@ -226,6 +229,7 @@
+             Ship::Context::GetInstance()->GetWindow()->SetResolutionMultiplier(
+                 CVarGetFloat(CVAR_INTERNAL_RESOLUTION, 1));
+         })
++#ifndef __IOS__
+         .PreFunc([](WidgetInfo& info) {
+             if (mGhostshipMenu->disabledMap.at(DISABLE_FOR_ADVANCED_RESOLUTION_ON).active &&
+                 mGhostshipMenu->disabledMap.at(DISABLE_FOR_VERTICAL_RES_TOGGLE_ON).active) {
+@@ -235,14 +239,31 @@
+                 info.activeDisables.push_back(DISABLE_FOR_LOW_RES_MODE_ON);
+             }
+         })
+-        .Options(
+-            FloatSliderOptions()
+-                .Tooltip("Multiplies your output resolution by the value inputted, as a more intensive but effective "
+-                         "form of anti-aliasing.")
+-                .ShowButtons(false)
+-                .IsPercentage()
+-                .Min(0.5f)
+-                .Max(2.0f));
++#endif // __IOS__: PreFunc gated so ResetDisables can't clobber disabled=true
++        .Options([]() {
++            auto gsResOpts = FloatSliderOptions()
++                                 .Tooltip("Multiplies your output resolution by the value inputted, as a more "
++                                          "intensive but effective form of anti-aliasing.")
++                                 .ShowButtons(false)
++                                 .IsPercentage()
++                                 .Min(0.5f)
++                                 .Max(2.0f);
++#ifdef __IOS__
++            // GS_IOS (0017, device feedback 2026-07-23): no-op on iOS/visionOS
++            // — this multiplier scales the Fast3dGui ImGui game-window path,
++            // which the iOS present pipeline bypasses; the game already renders
++            // at native drawable res, and true supersampling is the SSAA knob
++            // below. Pinned 1.0 (seeded v2) and greyed so it can't mislead.
++            // NOTE: this static disable only STICKS because the PreFunc above is
++            // #ifndef __IOS__'d out (rev2) — otherwise Menu::MenuDrawItem's
++            // ResetDisables() would reset it to false before every draw.
++            gsResOpts.disabled = true;
++            // ASCII only in widget strings (menu font renders em-dash as '?').
++            gsResOpts.disabledTooltip = "Not used on iOS/visionOS - the game already renders at native "
++                                        "resolution. Use Supersampling (SSAA) below for extra sharpness.";
++#endif
++            return gsResOpts;
++        }());
+ #ifndef __WIIU__
+     AddWidget(path, "Anti-aliasing (MSAA)", WIDGET_CVAR_SLIDER_INT)
+         .CVar(CVAR_MSAA_VALUE)
+@@ -357,6 +378,120 @@
+     path.sidebarName = "Controls";
+     path.column = SECTION_COLUMN_1;
+     AddSidebarEntry("Settings", "Controls", 1);
++
++#ifdef __IOS__
++    // GS_IOS (overlay 0017): phone-specific settings, organized:
++    // Touch Controls -> Display -> Menu -> Advanced. The touch overlay
++    // itself lives in the app shell (SohIosShell.m); these CVars are its
++    // knobs (consumed live by the shell's 0.25 s poll unless noted).
++    // NO Z-lock modes on this port: SM64's Z is crouch/ground-pound —
++    // momentary everything (Sync Wave 1 per-game policy).
++    path.sidebarName = "iOS";
++    AddSidebarEntry("Settings", "iOS", 1);
++
++    AddWidget(path, "Touch Controls", WIDGET_SEPARATOR_TEXT);
++    static std::unordered_map<int32_t, const char*> gsIosHapticsOptions = { { 0, "Off" },
++                                                                            { 1, "Light" },
++                                                                            { 2, "Strong" } };
++    AddWidget(path, "Haptic Feedback", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.Haptics")
++        .Options(ComboboxOptions()
++                     .ComboMap(gsIosHapticsOptions)
++                     .Tooltip("Vibration when touch buttons are pressed.")
++                     .DefaultIndex(1));
++    AddWidget(path, "Touch Control Opacity", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.TouchOpacity")
++        .Options(FloatSliderOptions()
++                     .Tooltip("How visible the on-screen controls are during play.")
++                     .ShowButtons(true)
++                     .IsPercentage()
++                     .Min(0.3f)
++                     .Max(1.0f)
++                     .DefaultValue(1.0f));
++    AddWidget(path, "Left-Handed Layout", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.LeftyFlip")
++        .Options(CheckboxOptions()
++                     .Tooltip("Mirrors all touch controls left<->right (custom layouts mirror too).")
++                     .DefaultValue(false));
++    static std::unordered_map<int32_t, const char*> gsIosCurveOptions = { { 0, "Linear" }, { 1, "Precise (Expo)" } };
++    AddWidget(path, "Stick Response", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.StickCurve")
++        .Options(ComboboxOptions()
++                     .ComboMap(gsIosCurveOptions)
++                     .Tooltip("Linear: deflection maps 1:1. Precise: finer control near the center, same maximum.")
++                     .DefaultIndex(0));
++    AddWidget(path, "Customize Layout...", WIDGET_BUTTON)
++        .Callback([](WidgetInfo& info) { CVarSetInteger("gSohIos.EditLayout", 1); })
++        .Options(ButtonOptions().Tooltip(
++            "Rearrange the on-screen controls: drag any button (and the stick's spawn area), scale them with the "
++            "slider, then save with the checkmark. Reset restores the default layout."));
++
++    AddWidget(path, "Display", WIDGET_SEPARATOR_TEXT);
++    // GS_IOS (0017 rev): LITERAL fps values as keys — the shared shell's
++    // migration rewrites legacy 0/1 indices to 60/120, and the combobox
++    // does comboMap.at(storedValue): an index map here aborts on VP
++    // (out_of_range, device crash 2026-07-23).
++    static std::unordered_map<int32_t, const char*> gsIosFpsOptions = { { 60, "60 fps" },
++                                                                        { 90, "90 fps" },
++                                                                        { 120, "120 fps" } };
++    AddWidget(path, "Max Frame Rate", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.MaxFps")
++        .Options(ComboboxOptions()
++                     .ComboMap(gsIosFpsOptions)
++                     .Tooltip("Cap for Match Refresh Rate. 60 fps saves battery; 120 uses the full ProMotion panel.")
++                     .DefaultIndex(120));
++#if TARGET_OS_VISION
++    // GS_VISION (0017, playbook §1.4a — Ghostship's own finding, extended):
++    // on Vision Pro SSAA is AUTOMATIC and pinned 1.0 (the shell's
++    // SohIos_SsaaFactor returns 1.0 under TARGET_OS_VISION). The 3840
++    // drawable already renders ~2x the panel's angular resolution, past the
++    // oversampling optimum — a slider above 1.0 would be pure GPU spend with
++    // no visible gain. Show a truth line instead of the iPhone slider so
++    // users who know that knob aren't confused.
++    AddWidget(path, "Supersampling (SSAA): Automatic", WIDGET_TEXT);
++    AddWidget(path, "The 4K render already exceeds what the panel can resolve.", WIDGET_TEXT);
++#else
++    AddWidget(path, "Supersampling (SSAA)", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.Supersample")
++        .Options(FloatSliderOptions()
++                     .Tooltip("Renders above native resolution and downsamples for smoother, less-grainy visuals "
++                              "(especially with HD/4K texture packs). 1.0 = native; 2.0 = 4x the pixels. A default "
++                              "is chosen for your device at first launch; raise for quality, lower if it drops frames "
++                              "or warms up.")
++                     .ShowButtons(true)
++                     .Min(1.0f)
++                     .Max(2.0f)
++                     .Format("%.2f")
++                     .DefaultValue(1.0f));
++#endif
++    AddWidget(path, "Performance HUD", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.PerfHud")
++        .Options(CheckboxOptions()
++                     .Tooltip("Small fps + thermal readout in the top-right corner.")
++                     .DefaultValue(false));
++
++    AddWidget(path, "Menu", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Menu Scale", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.MenuScale")
++        .Callback([](WidgetInfo& info) { GameEngine::Instance->ScaleImGui(); })
++        .Options(FloatSliderOptions()
++                     .Tooltip("Size of this menu and its text. Applies immediately.")
++                     .ShowButtons(true)
++                     .IsPercentage()
++                     .Min(0.6f)
++                     .Max(1.2f)
++                     .DefaultValue(0.85f));
++
++    AddWidget(path, "Advanced", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Remote Console", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.RemoteConsole")
++        .Options(CheckboxOptions()
++                     .Tooltip("Opens a TCP debug console on port 8769 while the app runs, reachable from your "
++                              "local network. Leave off unless troubleshooting.")
++                     .DefaultValue(false));
++
++    path.sidebarName = "Controls";
++#endif
+     AddWidget(path, "Clear Devices", WIDGET_BUTTON)
+         .Callback([](WidgetInfo& info) {
+             GhostshipGui::mModalWindow->RegisterPopup(

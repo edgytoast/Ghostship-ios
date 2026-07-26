@@ -1,0 +1,32 @@
+Overlay patch 0012 (rebased for pin 49c5312a): wire the iOS app shell
+(app/ios/SohIosShell.m) into the game target and have LUS call it right
+after SDL creates its window. The shell lives in the Ghostship-ios repo
+(not vendor); its dir is passed as -DGS_IOS_SHELL_DIR. It grafts SDL's
+UIWindow onto the active UIWindowScene, forces landscape, and hosts the
+touch layer. rev2: rehomed hunk 2 — upstream inserted an __EMSCRIPTEN__
+canvas-resize block right after SDL_CreateWindow.
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -62,6 +62,10 @@
+ #endif
+ 
+ namespace Fast {
++#ifdef __IOS__
++// iOS app shell hook (overlay 0012), implemented in app/ios/SohIosShell.m.
++extern "C" void SohIos_OnWindowCreated(struct SDL_Window*);
++#endif
+ const SDL_Scancode lus_to_sdl_table[] = {
+     SDL_SCANCODE_UNKNOWN,
+     SDL_SCANCODE_ESCAPE,
+@@ -425,6 +429,10 @@
+     }
+ #endif
+     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
++#ifdef __IOS__
++    // Graft onto the active UIWindowScene, force landscape, host touch controls.
++    SohIos_OnWindowCreated(mWnd);
++#endif
+ #ifdef __EMSCRIPTEN__
+     em_ui_callback_func onCanvasResize = [](int, const EmscriptenUiEvent*, void* userData) -> EM_BOOL {
+         auto backend = static_cast<GfxWindowBackendSDL2*>(userData);

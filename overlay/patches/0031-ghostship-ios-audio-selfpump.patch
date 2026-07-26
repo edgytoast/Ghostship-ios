@@ -1,0 +1,145 @@
+Overlay patch 0031: iOS audio self-pump — THE sibling-wide "fuzzy audio
+on thumb-press" fix (2ship overlay 0024 / PORTING-DELTAS.md, device-confirmed
+across every port except SoH). Ghostship's HandleAudioThread is the OLD
+coupled loop: a plain cv.wait() that produces one frame only on the game
+loop's per-tick notify. On iOS the game loop IS the UIKit main thread, so a
+pressed thumb's up-to-120 Hz touch events delay the notify past the ring's
+headroom and the SDL backend drains to crackle. SoH is clean because upstream
+evolved this exact loop (their clicks fix #6594): a 5 ms self-pump (wait_for),
+a producer guard, and a pre-buffer reservoir. Ported __IOS__-gated (macOS
+oracle keeps pristine upstream behavior), preserving Ghostship's
+processing/cv_from_thread handshake and its master-volume + ModAudio_MixInto
+production verbatim in produce_and_play.
+
+DEGENERACY CHECK (mandatory per the deltas doc; it caught a shipped-quality
+bug on 2ship): SoH's exact producer guard (Buffered + burst <= Desired)
+COLLAPSES here — one production is ~1088 samples and DesiredBuffered is 1100
+(≈ one burst), so it would only produce when nearly empty and the ring would
+hit empty every cycle. Use the documented skip-when-above intent instead
+(produce while Buffered <= Desired); overshoot is bounded to one burst, well
+under the SDL backend's refusal. Instrumented: min/max backend-buffered
+samples per window into atomics the 0008 probe reports as aud_min/aud_max
+(0 = underrun — the retest number). Coupled to 0008 (the probe reads the
+atomics this patch defines); the series applies atomically. rev: audio-thread
+QoS (USER_INTERACTIVE) so thermal pressure can't starve it.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -1215,11 +1215,109 @@
+ }
+ 
+ // Audio
++
++#include <atomic>
++#include <cstdint>
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
++// GS_IOS (overlay 0031): min/max backend-buffered samples seen this report
++// window; the 0008 perf probe reads+resets them as aud_min/aud_max (0 =
++// underrun — the fuzzy-audio retest instrument). Fed only by the __IOS__
++// self-pump loop below; benign unused statics on the macOS build.
++std::atomic<int32_t> sGsIosAudMinBuffered{ INT32_MAX };
++std::atomic<int32_t> sGsIosAudMaxBuffered{ -1 };
+ 
+ void GameEngine::HandleAudioThread() {
++#ifdef __IOS__
++    // GS_IOS (overlay 0031): THE sibling-wide "fuzzy audio on thumb-press"
++    // fix. The #else loop (upstream) produces audio ONLY on the game loop's
++    // per-tick cv notify; on iOS the game loop IS the UIKit main thread, so a
++    // pressed thumb's up-to-120 Hz touch events delay the notify past the
++    // ring's headroom and the backend drains to crackle. SoH is clean because
++    // upstream evolved this exact loop (self-pump + producer guard + pre-
++    // buffer reservoir; clicks fix #6594). Handshake preserved.
++    //
++    // QoS: explicit user-interactive class so thermal pressure can't starve
++    // this thread (2ship VP-4K finding). Must run ON this thread, first.
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++
++    auto produce_and_play = [&](u32 num_audio_samples) {
++        s16 audio_buffer[SAMPLES_PER_FRAME];
++        for (int i = 0; i < NUM_AUDIO_CHANNELS; i++) {
++            create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
++        }
++        float master_vol = CVarGetInteger("gSettings.Volume.Master", 100) / 100.0f;
++        for (u32 i = 0; i < SAMPLES_PER_FRAME; i++) {
++            audio_buffer[i] = static_cast<s16>(audio_buffer[i] * master_vol);
++        }
++        ModAudio_MixInto(audio_buffer, num_audio_samples * 2);
++        AudioPlayerPlayFrame((u8*)audio_buffer, 2 * num_audio_samples * 4);
++    };
++
++    // Self-pump cadence: wake on a short timeout independent of the gfx frame
++    // rate, so touch/redraw bursts on the main thread can't stall audio.
++    constexpr auto kSelfPumpInterval = std::chrono::milliseconds(5);
++    // Wait for the first real gfx notify before self-pumping (avoid touching
++    // uninitialized audio state).
++    bool primed = false;
++
+     while (audio.running) {
++        bool wasProcessing = false;
+         {
+             std::unique_lock<std::mutex> Lock(audio.mutex);
++            if (!primed) {
++                while (!audio.processing && audio.running) {
++                    audio.cv_to_thread.wait(Lock);
++                }
++                primed = true;
++            } else if (!audio.processing && audio.running) {
++                audio.cv_to_thread.wait_for(Lock, kSelfPumpInterval);
++            }
++            if (!audio.running) {
++                break;
++            }
++            wasProcessing = audio.processing;
++        }
++
++        {
++            std::unique_lock<std::mutex> Lock(audio.mutex);
++            int samples_left = AudioPlayerBuffered();
++            int32_t prevMin = sGsIosAudMinBuffered.load();
++            while (samples_left < prevMin && !sGsIosAudMinBuffered.compare_exchange_weak(prevMin, samples_left)) {
++            }
++            int32_t prevMax = sGsIosAudMaxBuffered.load();
++            while (samples_left > prevMax && !sGsIosAudMaxBuffered.compare_exchange_weak(prevMax, samples_left)) {
++            }
++            u32 num_audio_samples = samples_left < AudioPlayerGetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
++            // Producer guard: skip-when-above Desired (documented intent).
++            // SoH's exact formula (Buffered + burst <= Desired) DEGENERATES
++            // here — one production ~= 1088 ~= DesiredBuffered (1100), so it
++            // would produce only when nearly empty and the ring would hit
++            // empty every cycle (the 2ship 1680-burst lesson). Overshoot
++            // bounded to one burst, safely under the backend's refusal.
++            if (AudioPlayerBuffered() <= AudioPlayerGetDesiredBuffered()) {
++                produce_and_play(num_audio_samples);
++            }
++            if (wasProcessing) {
++                audio.processing = false;
++                audio.cv_from_thread.notify_one();
++            }
++        }
++
++        // Pre-buffer reservoir: top the ring up to Desired, absorbing main-
++        // thread load spikes (the BGM sequencer advances independently, so
++        // producing ahead is safe). Overshoot bounded to one burst per exit.
++        while (audio.running && AudioPlayerBuffered() < AudioPlayerGetDesiredBuffered()) {
++            int samples_left = AudioPlayerBuffered();
++            u32 num_audio_samples = samples_left < AudioPlayerGetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
++            produce_and_play(num_audio_samples);
++        }
++    }
++#else
++    while (audio.running) {
++        {
++            std::unique_lock<std::mutex> Lock(audio.mutex);
+             while (!audio.processing && audio.running) {
+                 audio.cv_to_thread.wait(Lock);
+             }
+@@ -1251,6 +1349,7 @@
+         audio.processing = false;
+         audio.cv_from_thread.notify_one();
+     }
++#endif
+ }
+ 
+ void GameEngine::StartAudioFrame() {
