@@ -10,6 +10,7 @@ GS_O2R="$ROOT/oracle/build-cmake/ghostship.o2r"
 [[ -f "$GS_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Ghostship" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=visionOS -DPLATFORM=SIMULATOR_VISIONOS \
     -DCMAKE_OSX_SYSROOT=xrsimulator \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=2.0 -DCMAKE_BUILD_TYPE:STRING=Release \
@@ -20,6 +21,7 @@ cmake --no-warn-unused-cli -S "$ROOT/vendor/Ghostship" -B "$BUILD" -GXcode \
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
     -DSDL_OPENGLES=OFF -DSDL_OPENGL=OFF \
     -DIOS_SIGNING=OFF \
+    "-DSOH_REMOTE_CONSOLE=${SOH_REMOTE_CONSOLE:-ON}" \
     "-DGS_O2R_PATH=$GS_O2R" \
     "-DGS_IOS_SHELL_DIR=$ROOT/app/ios"
 

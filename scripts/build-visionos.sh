@@ -41,5 +41,5 @@ lipo -info "$APP/Ghostship"
 plutil -extract UIApplicationSceneManifest.UIApplicationSupportsMultipleScenes raw \
     "$APP/Info.plist" | grep -qx "true" || {
     echo "FATAL: UIApplicationSupportsMultipleScenes missing from Info.plist" >&2; exit 1; }
-codesign -dv "$APP" 2>&1 | sed -n '1,3p'
+codesign -dv "$APP" 2>&1 | sed -n '1,3p' || true
 echo "built (visionOS device): $APP"

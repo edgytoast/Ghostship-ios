@@ -16,6 +16,7 @@ fi
 [[ -f "$GS_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Ghostship" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=OS64 \
     -DCMAKE_OSX_SYSROOT=iphoneos \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_BUILD_TYPE:STRING=Release \

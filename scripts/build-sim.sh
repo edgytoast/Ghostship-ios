@@ -10,6 +10,7 @@ GS_O2R="$ROOT/oracle/build-cmake/ghostship.o2r"
 [[ -f "$GS_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Ghostship" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=SIMULATORARM64 \
     -DCMAKE_OSX_SYSROOT=iphonesimulator \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_BUILD_TYPE:STRING=Release \
